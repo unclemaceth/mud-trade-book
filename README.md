@@ -14,7 +14,12 @@ Program id: `Mudav3fe4qFihgcfCdZAXxNFupTuJR2pUa6Qo7M3CBN`
 
 Requires Anchor 1.2.1, Solana CLI 3.0.0 and Rust 1.89.0 (`rust-toolchain.toml`).
 
+The tests run in LiteSVM against the real Metaplex Core binary, and the IDL build compiles
+them, so dump Core from mainnet before the first build:
+
 ```bash
+solana program dump -u mainnet-beta CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d tests/fixtures/mpl_core.so
+# sha256 51d41542456639a01820c747e72b9d3b4ca258930a5bbb7e78db0cda133dc209 at the time of writing
 bash scripts/build.sh          # SBPF v0 release build, prints ELF and IDL hashes
 bash scripts/build.sh --twice  # two clean builds, requires identical hashes
 ```
@@ -28,12 +33,7 @@ IDL sha256 d60505c63666a1d6b7b7397d319d1cae03c2ca91067f817edc140a1089607c63
 
 ## Test
 
-The tests run in LiteSVM against the real Metaplex Core binary. Dump it from mainnet first:
-
 ```bash
-solana program dump -u mainnet-beta CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d tests/fixtures/mpl_core.so
-# sha256 51d41542456639a01820c747e72b9d3b4ca258930a5bbb7e78db0cda133dc209 at the time of writing
-bash scripts/build.sh
 cargo test
 MTB_FUZZ_CASES=20000 cargo test --test fuzz -- --nocapture   # the long fuzz run
 ```
