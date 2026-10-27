@@ -1,0 +1,29 @@
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.surfpool
+*.log
+
+# Keys and secrets never live in this repo. solana-keygen grind writes <PUBKEY>.json, so
+# every JSON outside the two fixtures is ignored.
+.keys
+*.json
+!tests/fixtures/card_DHqi.json
+!tests/fixtures/collection_2Qa6.json
+*.pem
+*.key
+.env*
+
+# Editor and agent state.
+.vscode
+.idea
+.cursor
+.claude
+AGENTS.md
+CLAUDE.md
+
+# Dumped from mainnet by the builder (see README).
+tests/fixtures/mpl_core.so
