@@ -4,9 +4,15 @@ A Solana program for escrowless card-for-card swaps of Mudwater Cards (Metaplex 
 assets, collection `2Qa62ZQoytj3TL4BtRpj8Eujta3zpG93gqXtBg7C5g3p`).
 
 A maker lists the cards they give and the cards they want, up to four on each side. Listed
-cards never leave the maker's wallet: the program holds a Core `TransferDelegate` on each one.
-A taker fills the offer with matching cards and both sides move in one transaction. Cancelling
-or closing an offer revokes every delegation it set.
+cards never leave the maker's wallet: each offer has its own Core `TransferDelegate` PDA on
+its cards, so an approval granted for one offer can never fill another. A taker fills the
+offer with matching cards and both sides move in one transaction. The taker pays a flat trade
+fee, set by the admin up to 0.01 SOL and capped per fill by the taker's `max_fee`. Cancelling
+or closing an offer revokes the offer's delegation on every card the maker still holds,
+whichever collection the card is in by then.
+
+Wants can name an exact asset or any card from a fixed registry, by card number and finish
+(Base, Foil, Serialized).
 
 Program id: `Mudav3fe4qFihgcfCdZAXxNFupTuJR2pUa6Qo7M3CBN`
 
@@ -27,8 +33,8 @@ bash scripts/build.sh --twice  # two clean builds, requires identical hashes
 Expected output for this commit:
 
 ```
-ELF sha256 d8752bb456ab0b6147cf222efc7aba77ec56d0cea0c8ee27d28cc0e2008eeb4c (454248 bytes)
-IDL sha256 d60505c63666a1d6b7b7397d319d1cae03c2ca91067f817edc140a1089607c63
+ELF sha256 75560d24977dca422980bbdcf65c8297049c3b0e2025103c60d26793d0c43c0a (503896 bytes)
+IDL sha256 c1240b044bdb078011dbc8ae9d3a37f86991767da80c41b259111fe8432ef237
 ```
 
 ## Test

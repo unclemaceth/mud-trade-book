@@ -1,4 +1,4 @@
-use anchor_lang::prelude::*;
+use anchor_lang::{prelude::*, system_program};
 
 use crate::{
     checks::{check_give_asset, is_expired},
@@ -6,7 +6,7 @@ use crate::{
     core_io::{core_transfer, read_asset, TransferAccounts},
     error::TradeError,
     listing::close_listed,
-    state::{CardRecord, Config, Offer, OfferFilled, Slot},
+    state::{CardRecord, Config, FeeConfig, Offer, OfferFilled, Slot},
 };
 
 #[derive(Accounts)]
@@ -30,9 +30,19 @@ pub struct FillOffer<'info> {
     pub maker: UncheckedAccount<'info>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
-    /// CHECK: PDA with no data; signs the Core transfers of the give cards.
-    #[account(seeds = [DELEGATE_SEED], bump)]
+    /// CHECK: this offer's delegate PDA, no data; signs the Core transfers of the give cards.
+    #[account(seeds = [DELEGATE_SEED, offer.key().as_ref()], bump)]
     pub delegate: UncheckedAccount<'info>,
+    #[account(seeds = [FEE_SEED], bump = fee_config.bump)]
+    pub fee_config: Account<'info, FeeConfig>,
+    /// CHECK: pinned to the configured recipient, which must still be a system wallet (a program
+    /// account could not take the transfer); only receives lamports.
+    #[account(
+        mut,
+        address = fee_config.recipient @ TradeError::WrongFeeRecipient,
+        owner = system_program::ID @ TradeError::BadFeeRecipient
+    )]
+    pub fee_recipient: UncheckedAccount<'info>,
     /// CHECK: must be the configured collection, owned by Core.
     #[account(
         address = config.collection @ TradeError::WrongCollection,
@@ -47,9 +57,13 @@ pub struct FillOffer<'info> {
 
 /// Remaining accounts: the give assets (offer order), the taker's assets (slot order), the give
 /// cards' `Listed` PDAs (offer order), then one `CardRecord` per `Cards` slot (slot order).
-pub fn handle_fill_offer<'info>(ctx: Context<'info, FillOffer<'info>>) -> Result<()> {
+/// The taker pays the configured fee and names the most they accept in `max_fee`, so a fee
+/// raised after they built the transaction makes it fail instead of charging more.
+pub fn handle_fill_offer<'info>(ctx: Context<'info, FillOffer<'info>>, max_fee: u64) -> Result<()> {
     let config = &ctx.accounts.config;
     require!(!config.paused, TradeError::Paused);
+    let fee = ctx.accounts.fee_config.lamports;
+    require!(fee <= max_fee, TradeError::FeeAboveMax);
     require!(
         config.public || ctx.accounts.taker_permit.owner == ctx.program_id,
         TradeError::NotPermitted
@@ -105,8 +119,10 @@ pub fn handle_fill_offer<'info>(ctx: Context<'info, FillOffer<'info>>) -> Result
             Slot::Asset(wanted) => require_keys_eq!(*key, *wanted, TradeError::SlotMismatch),
             Slot::Cards { .. } => {
                 let record_info = records.next().ok_or(TradeError::AccountCount)?;
-                let card = read_card_record(record_info, key, ctx.program_id)?;
-                require!(slot.matches_card(card.card_id()), TradeError::SlotMismatch);
+                let card = read_card_record(record_info, key, ctx.program_id)?
+                    .card_id()
+                    .ok_or(TradeError::BadCardRecord)?;
+                require!(slot.matches_card(card), TradeError::SlotMismatch);
             }
         }
     }
@@ -117,8 +133,22 @@ pub fn handle_fill_offer<'info>(ctx: Context<'info, FillOffer<'info>>) -> Result
     let maker_info = ctx.accounts.maker.to_account_info();
     let delegate_info = ctx.accounts.delegate.to_account_info();
     let system_info = ctx.accounts.system_program.to_account_info();
+    let offer_key = ctx.accounts.offer.key();
     let delegate_bump = [ctx.bumps.delegate];
-    let delegate_seeds: &[&[u8]] = &[DELEGATE_SEED, &delegate_bump];
+    let delegate_seeds: &[&[u8]] = &[DELEGATE_SEED, offer_key.as_ref(), &delegate_bump];
+
+    if fee > 0 {
+        system_program::transfer(
+            CpiContext::new(
+                system_program::ID,
+                system_program::Transfer {
+                    from: taker_info.clone(),
+                    to: ctx.accounts.fee_recipient.to_account_info(),
+                },
+            ),
+            fee,
+        )?;
+    }
 
     for info in give_infos {
         core_transfer(
@@ -149,7 +179,6 @@ pub fn handle_fill_offer<'info>(ctx: Context<'info, FillOffer<'info>>) -> Result
         )?;
     }
 
-    let offer_key = ctx.accounts.offer.key();
     for (key, info) in offer.give.iter().zip(listed_infos) {
         close_listed(info, key, &offer_key, &maker_info, ctx.program_id)?;
     }
@@ -160,6 +189,7 @@ pub fn handle_fill_offer<'info>(ctx: Context<'info, FillOffer<'info>>) -> Result
         taker: taker_key,
         give: offer.give.clone(),
         got: taker_infos.iter().map(|i| *i.key).collect(),
+        fee,
     });
     Ok(())
 }
@@ -169,13 +199,12 @@ fn read_card_record(info: &AccountInfo, asset: &Pubkey, program_id: &Pubkey) -> 
     require_keys_eq!(*info.owner, *program_id, TradeError::BadCardRecord);
     let record = {
         let data = info.try_borrow_data()?;
-        CardRecord::try_deserialize(&mut &data[..]).map_err(|_| error!(TradeError::BadCardRecord))?
+        CardRecord::try_deserialize(&mut &data[..])
+            .map_err(|_| error!(TradeError::BadCardRecord))?
     };
-    let expected = Pubkey::create_program_address(
-        &[CARD_SEED, asset.as_ref(), &[record.bump]],
-        program_id,
-    )
-    .map_err(|_| error!(TradeError::BadCardRecord))?;
+    let expected =
+        Pubkey::create_program_address(&[CARD_SEED, asset.as_ref(), &[record.bump]], program_id)
+            .map_err(|_| error!(TradeError::BadCardRecord))?;
     require_keys_eq!(*info.key, expected, TradeError::BadCardRecord);
     Ok(record)
 }

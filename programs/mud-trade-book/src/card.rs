@@ -6,6 +6,7 @@ use crate::constants::*;
 pub enum Finish {
     Base,
     Foil,
+    Serialized,
 }
 
 impl Finish {
@@ -13,6 +14,17 @@ impl Finish {
         match self {
             Finish::Base => FINISH_BASE,
             Finish::Foil => FINISH_FOIL,
+            Finish::Serialized => FINISH_SERIALIZED,
+        }
+    }
+
+    /// Exactly one finish bit; anything else is `None`.
+    pub fn from_bit(bit: u8) -> Option<Finish> {
+        match bit {
+            FINISH_BASE => Some(Finish::Base),
+            FINISH_FOIL => Some(Finish::Foil),
+            FINISH_SERIALIZED => Some(Finish::Serialized),
+            _ => None,
         }
     }
 }
@@ -25,17 +37,19 @@ pub struct CardId {
 }
 
 /// `https://assets.mudwater.bayc.com/m/c/<idx>-<serial>`: decimal digits only, no sign, no
-/// leading zeros except a lone `0`, idx 0..=239, serial fits u32, nothing after.
+/// leading zeros except a lone `0`, idx 0..=359, serial fits u32, nothing after. idx / 120 is
+/// the finish (0 Base, 1 Foil, 2 Serialized), idx % 120 + 1 the card number.
 pub fn parse_card_uri(uri: &str) -> Option<CardId> {
     let rest = uri.as_bytes().strip_prefix(CARD_URI_PREFIX)?;
     let dash = rest.iter().position(|b| *b == b'-')?;
     let idx = parse_decimal(rest.get(..dash)?, MAX_CARD_INDEX)?;
     parse_decimal(rest.get(dash.checked_add(1)?..)?, u64::from(u32::MAX))?;
     let card_no = u8::try_from(idx.checked_rem(CARD_COUNT)?.checked_add(1)?).ok()?;
-    let finish = if idx >= CARD_COUNT {
-        Finish::Foil
-    } else {
-        Finish::Base
+    let finish = match idx.checked_div(CARD_COUNT)? {
+        0 => Finish::Base,
+        1 => Finish::Foil,
+        2 => Finish::Serialized,
+        _ => return None,
     };
     Some(CardId { card_no, finish })
 }
@@ -79,21 +93,48 @@ mod tests {
 
     #[test]
     fn every_index_maps_to_card_and_finish() {
-        for idx in 0u64..=300 {
+        for idx in 0u64..=500 {
             let parsed = parse_card_uri(&uri(&format!("{idx}-7")));
-            if idx <= 239 {
+            if idx <= 359 {
                 let c = parsed.expect("in range");
                 assert_eq!(u64::from(c.card_no), idx % 120 + 1);
-                assert_eq!(
-                    c.finish,
-                    if idx >= 120 {
-                        Finish::Foil
-                    } else {
-                        Finish::Base
-                    }
-                );
+                let finish = match idx / 120 {
+                    0 => Finish::Base,
+                    1 => Finish::Foil,
+                    _ => Finish::Serialized,
+                };
+                assert_eq!(c.finish, finish);
             } else {
                 assert_eq!(parsed, None, "idx {idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn serialized_vectors_from_live_metadata() {
+        // Read from the Mudwater metadata API, 2026-10-27: 240-0 is #001 1/99, 300-1 is #061
+        // 2/5, 359-0 is #120 1/1.
+        for (tail, card_no) in [("240-0", 1), ("300-1", 61), ("359-0", 120)] {
+            assert_eq!(
+                parse_card_uri(&uri(tail)),
+                Some(CardId {
+                    card_no,
+                    finish: Finish::Serialized
+                }),
+                "{tail}"
+            );
+        }
+        assert_eq!(parse_card_uri(&uri("360-0")), None);
+    }
+
+    #[test]
+    fn finish_bits_round_trip() {
+        for f in [Finish::Base, Finish::Foil, Finish::Serialized] {
+            assert_eq!(Finish::from_bit(f.bit()), Some(f));
+        }
+        for bit in 0u8..=255 {
+            if ![FINISH_BASE, FINISH_FOIL, FINISH_SERIALIZED].contains(&bit) {
+                assert_eq!(Finish::from_bit(bit), None, "{bit:#b}");
             }
         }
     }
@@ -129,7 +170,7 @@ mod tests {
             "https://assets.mudwater.bayc.com/m/x/1-1".to_string(),
             "1-1".to_string(),
             "".to_string(),
-            uri("240-1"),
+            uri("360-1"),
             uri("01-1"),
             uri("00-1"),
             uri("1-01"),

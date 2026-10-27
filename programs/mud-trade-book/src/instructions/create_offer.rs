@@ -5,7 +5,7 @@ use crate::{
     constants::*,
     error::TradeError,
     listing::create_listed,
-    state::{Config, Offer, OfferCreated, Slot},
+    state::{Config, MakerState, Offer, OfferCreated, Slot},
 };
 
 #[derive(Accounts)]
@@ -27,13 +27,24 @@ pub struct CreateOffer<'info> {
         bump
     )]
     pub offer: Account<'info, Offer>,
-    /// CHECK: PDA with no data; only its address is used here.
-    #[account(seeds = [DELEGATE_SEED], bump)]
+    /// CHECK: this offer's delegate PDA, no data; only its address is used here. The client
+    /// derives the offer address first and approves this delegate in the same transaction.
+    #[account(seeds = [DELEGATE_SEED, offer.key().as_ref()], bump)]
     pub delegate: UncheckedAccount<'info>,
+    /// Created by the maker's first offer. Never closed, so an offer id is never used twice.
+    #[account(
+        init_if_needed,
+        payer = maker,
+        space = 8 + MakerState::INIT_SPACE,
+        seeds = [MAKER_SEED, maker.key().as_ref()],
+        bump
+    )]
+    pub maker_state: Account<'info, MakerState>,
     pub system_program: Program<'info, System>,
 }
 
 /// Remaining accounts: the give assets (in `give` order), then their `Listed` PDAs (same order).
+/// `offer_id` must be the maker's last offer id plus one (the first is 1).
 pub fn handle_create_offer<'info>(
     ctx: Context<'info, CreateOffer<'info>>,
     offer_id: u64,
@@ -54,6 +65,15 @@ pub fn handle_create_offer<'info>(
     );
     let clock = Clock::get()?;
     check_expiry_at_creation(clock.unix_timestamp, expires_at)?;
+
+    let maker_state = &mut ctx.accounts.maker_state;
+    let next = maker_state
+        .last_offer_id
+        .checked_add(1)
+        .ok_or(TradeError::Overflow)?;
+    require!(offer_id == next, TradeError::OfferIdNotNext);
+    maker_state.last_offer_id = offer_id;
+    maker_state.bump = ctx.bumps.maker_state;
 
     let n = give.len();
     let expected_len = n.checked_mul(2).ok_or(TradeError::Overflow)?;

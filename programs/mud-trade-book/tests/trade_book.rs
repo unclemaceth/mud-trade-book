@@ -45,7 +45,7 @@ fn assert_filled(
     for a in give {
         assert_eq!(env.owner_of(a), taker, "give card {a} not with taker");
         assert!(
-            !env.read(a).delegate_is(&env.delegate),
+            !env.delegated_to(a, offer),
             "delegate survived the transfer"
         );
         assert!(!env.exists(&env.listed_pda(a)), "Listed PDA not closed");
@@ -92,7 +92,7 @@ fn t01_exact_for_exact() {
     let asset_lamports = env.lamports(&a);
     let exp = in_a_week(&env);
     let maker = env.maker.insecure_clone();
-    let mut ixs = vec![env.delegate_ix(a, &m)];
+    let mut ixs = vec![env.delegate_ix(a, &m, &env.offer_pda(&m, 1))];
     ixs.push(env.create_offer_ix(&m, 1, &[a], &[Slot::Asset(b)], exp));
     let listed = env.send(&ixs, &maker, &[]).res;
     assert!(listed.is_ok(), "{listed:#?}");
@@ -101,10 +101,10 @@ fn t01_exact_for_exact() {
     let plugin_rent = env.lamports(&a) - asset_lamports;
     assert_eq!(
         env.lamports(&m),
-        before_list.lamports[0].1 - fee_of(&listed) - rent - plugin_rent,
-        "listing cost = fee + offer/listed rent + plugin rent"
+        before_list.lamports[0].1 - fee_of(&listed) - rent - plugin_rent - env.maker_state_rent(),
+        "listing cost = fee + offer/listed rent + plugin rent + the maker counter (first offer)"
     );
-    assert!(env.read(&a).delegate_is(&env.delegate));
+    assert!(env.delegated_to(&a, &offer));
     assert_eq!(env.owner_of(&a), m, "listing must not move the card");
 
     let before = env.snap(&wallets(&env), &[a, b]);
@@ -283,7 +283,7 @@ fn t08_paused_create_and_fill() {
     let m = env.maker.pubkey();
     let c = env.mint(&m, base(33), 1);
     let maker = env.maker.insecure_clone();
-    env.add_delegate(c, &maker);
+    env.add_delegate(c, &maker, &env.offer_pda(&m, 2));
     let before = env.snap(&wallets(&env), &[a, b, c]);
     let res = env
         .create_offer(&maker, 2, &[c], &[Slot::Asset(b)], exp)
@@ -324,7 +324,7 @@ fn t09_maker_moved_give_card() {
 
     // The new owner cannot list the card while the stale Listed PDA exists.
     let stranger = env.stranger.insecure_clone();
-    env.add_delegate(a, &stranger);
+    env.add_delegate(a, &stranger, &env.offer_pda(&stranger.pubkey(), 1));
     let res = env
         .create_offer(&stranger, 1, &[a], &[Slot::Asset(b)], exp)
         .res;
@@ -355,7 +355,7 @@ fn t10_maker_revoked_delegate() {
     let (offer, a, b) = simple(&mut env, exp);
     let maker = env.maker.insecure_clone();
     env.revoke_delegate(a, &maker);
-    assert!(!env.read(&a).delegate_is(&env.delegate));
+    assert!(!env.delegated_to(&a, &offer));
 
     let taker = env.taker.insecure_clone();
     let before = env.snap(&wallets(&env), &[a, b]);
@@ -397,7 +397,7 @@ fn t11_taker_asset_from_another_collection() {
 
     // Passing the other collection as the collection account is refused too.
     let mut ix = env.fill_ix_with(&t, &offer, &[a], &[foreign], CORE_ID);
-    ix.accounts[6].pubkey = other;
+    ix.accounts[8].pubkey = other;
     let res = env.send(&[ix], &taker, &[]).res;
     assert_trade_err(&res, TradeError::WrongCollection);
 
@@ -412,7 +412,7 @@ fn t11_taker_asset_from_another_collection() {
             mpl_core::types::TransferDelegate {},
         ))
         .init_authority(mpl_core::types::PluginAuthority::Address {
-            address: env.delegate,
+            address: env.delegate_of(&env.offer_pda(&m, 2)),
         })
         .instruction()];
     ixs.push(env.create_offer_ix(&m, 2, &[foreign_give], &[Slot::Asset(a)], exp));
@@ -493,7 +493,7 @@ fn t15_uri_not_in_scheme() {
         "https://assets.mudwater.bayc.co/m/c/31-303", // wrong host
         "https://evil.example/m/c/31-303",            // wrong host
         "http://assets.mudwater.bayc.com/m/c/31-303", // wrong scheme
-        "https://assets.mudwater.bayc.com/m/c/240-1", // idx out of range
+        "https://assets.mudwater.bayc.com/m/c/360-1", // idx out of range
         "https://assets.mudwater.bayc.com/m/c/01-1",  // leading zero
         "https://assets.mudwater.bayc.com/m/c/1-",    // empty serial
         "https://assets.mudwater.bayc.com/m/c/1-2x",  // trailing junk
@@ -511,8 +511,18 @@ fn t15_uri_not_in_scheme() {
         // Registration reads the URI, so a card outside the scheme can never get a record,
         // even under a root that lists it.
         let (root_index, proofs) = env.publish_root(&[(b, 31, FINISH_BASE)]);
-        let ix = env.register_card_ix(&admin.pubkey(), root_index, &b, 31, FINISH_BASE, proofs[0].clone());
-        assert_trade_err(&env.send(&[ix], &admin, &[]).res, TradeError::UnrecognisedCard);
+        let ix = env.register_card_ix(
+            &admin.pubkey(),
+            root_index,
+            &b,
+            31,
+            FINISH_BASE,
+            proofs[0].clone(),
+        );
+        assert_trade_err(
+            &env.send(&[ix], &admin, &[]).res,
+            TradeError::UnrecognisedCard,
+        );
         // Without a record, a Cards slot refuses it.
         let before = env.snap(&wallets(&env), &[a, b]);
         let res = env.fill(&taker, &offer, &[b]).res;
@@ -545,16 +555,17 @@ fn t17_same_card_in_two_offers() {
     let maker = env.maker.insecure_clone();
     let m = maker.pubkey();
     let before = env.snap(&wallets(&env), &[a, b]);
-    let res = env
-        .create_offer(&maker, 2, &[a], &[cards_slot(&[1], FINISH_ALL)], exp)
-        .res;
+    // Even with the card approved to the second offer's own delegate.
+    let mut ixs = env.redelegate_ixs(a, &m, env.delegate_of(&env.offer_pda(&m, 2)));
+    ixs.push(env.create_offer_ix(&m, 2, &[a], &[cards_slot(&[1], FINISH_ALL)], exp));
+    let res = env.send(&ixs, &maker, &[]).res;
     assert_trade_err(&res, TradeError::AlreadyListed);
     env.assert_nothing_moved(&before, &m, &res);
     assert!(!env.exists(&env.offer_pda(&m, 2)));
 
     // Twice in the same offer is refused before any PDA is touched.
     let c = env.mint(&m, base(40), 1);
-    env.add_delegate(c, &maker);
+    env.add_delegate(c, &maker, &env.offer_pda(&m, 3));
     let res = env
         .create_offer(&maker, 3, &[c, c], &[Slot::Asset(b)], exp)
         .res;
@@ -616,7 +627,7 @@ fn t20_create_without_ownership_or_delegate() {
     // Not the maker's card (the taker's, delegated by the taker to our PDA).
     let not_mine = env.mint(&t, base(10), 1);
     let taker = env.taker.insecure_clone();
-    env.add_delegate(not_mine, &taker);
+    env.add_delegate(not_mine, &taker, &env.offer_pda(&m, 1));
     let before = env.snap(&wallets(&env), &[not_mine]);
     let res = env.create_offer(&maker, 1, &[not_mine], &want, exp).res;
     assert_trade_err(&res, TradeError::NotOwner);
@@ -655,8 +666,10 @@ fn t21_counts_and_expiry() {
     let m = env.maker.pubkey();
     let maker = env.maker.insecure_clone();
     let give: Vec<Pubkey> = (1..=5).map(|n| env.mint(&m, base(n), 1)).collect();
+    // The cases below fail on counts or expiry before the delegate is read.
+    let first = env.offer_pda(&m, 1);
     for a in &give {
-        env.add_delegate(*a, &maker);
+        env.add_delegate(*a, &maker, &first);
     }
     let one = [cards_slot(&[1], FINISH_ALL)];
     let five: Vec<Slot> = (1..=5u8).map(|n| cards_slot(&[n], FINISH_ALL)).collect();
@@ -702,7 +715,7 @@ fn t21_counts_and_expiry() {
         (
             "reserved finish bit",
             give[..1].to_vec(),
-            vec![cards_slot(&[1], 0b111)],
+            vec![cards_slot(&[1], 0b1000)],
             exp,
             TradeError::BadWant,
         ),

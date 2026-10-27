@@ -21,7 +21,7 @@ custom-panic = []
 
 
 [dependencies]
-anchor-lang = "1.2.1"
+anchor-lang = { version = "1.2.1", features = ["init-if-needed"] }
 mpl-core = "0.12.1"
 # sha2 backs the off-chain build (unit tests, IDL); on chain the sol_sha256 syscall is used.
 solana-sha256-hasher = { version = "3.1.0", features = ["sha2"] }

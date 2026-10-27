@@ -40,23 +40,38 @@ pub struct CardRoot {
 #[derive(InitSpace)]
 pub struct CardRecord {
     pub card_no: u8,
-    /// `FINISH_BASE` or `FINISH_FOIL`.
+    /// `FINISH_BASE`, `FINISH_FOIL` or `FINISH_SERIALIZED`.
     pub finish: u8,
     pub root_index: u16,
     pub bump: u8,
 }
 
 impl CardRecord {
-    pub fn card_id(&self) -> CardId {
-        CardId {
+    /// `None` if `finish` is not exactly one finish bit.
+    pub fn card_id(&self) -> Option<CardId> {
+        Some(CardId {
             card_no: self.card_no,
-            finish: if self.finish == FINISH_FOIL {
-                Finish::Foil
-            } else {
-                Finish::Base
-            },
-        }
+            finish: Finish::from_bit(self.finish)?,
+        })
     }
+}
+
+/// The trade fee the taker pays on every fill. Admin-set, at most `MAX_FEE_LAMPORTS`.
+#[account]
+#[derive(InitSpace)]
+pub struct FeeConfig {
+    pub recipient: Pubkey,
+    pub lamports: u64,
+    pub bump: u8,
+}
+
+/// A maker's offer counter, created by their first offer and never closed. The next offer must
+/// use `last_offer_id + 1`.
+#[account]
+#[derive(InitSpace)]
+pub struct MakerState {
+    pub last_offer_id: u64,
+    pub bump: u8,
 }
 
 /// Admin-granted beta admission for one maker. Its existence is the permit.
@@ -95,7 +110,7 @@ pub enum Slot {
     /// Exactly this asset.
     Asset(Pubkey),
     /// Any asset whose card number is in `cards` (bit n-1 = card n) and whose finish is in
-    /// `finish_mask` (bit0 Base, bit1 Foil).
+    /// `finish_mask` (bit0 Base, bit1 Foil, bit2 Serialized).
     Cards { cards: [u8; 15], finish_mask: u8 },
 }
 
@@ -141,6 +156,8 @@ pub struct OfferFilled {
     pub taker: Pubkey,
     pub give: Vec<Pubkey>,
     pub got: Vec<Pubkey>,
+    /// Lamports the taker paid to the fee recipient.
+    pub fee: u64,
 }
 
 #[event]
@@ -189,6 +206,12 @@ pub struct OpenedPublic {}
 #[event]
 pub struct CardsEnabledChanged {
     pub enabled: bool,
+}
+
+#[event]
+pub struct FeeChanged {
+    pub recipient: Pubkey,
+    pub lamports: u64,
 }
 
 #[event]

@@ -4,7 +4,7 @@
 use anchor_lang::prelude::*;
 
 use crate::{
-    card::parse_card_uri,
+    card::{parse_card_uri, Finish},
     constants::*,
     core_io::read_asset,
     error::TradeError,
@@ -80,10 +80,7 @@ pub fn handle_register_card(
     proof: Vec<[u8; 32]>,
 ) -> Result<()> {
     require!(proof.len() <= MAX_PROOF_LEN, TradeError::ProofTooLong);
-    require!(
-        finish == FINISH_BASE || finish == FINISH_FOIL,
-        TradeError::CardMismatch
-    );
+    require!(Finish::from_bit(finish).is_some(), TradeError::CardMismatch);
     let asset_info = ctx.accounts.asset.to_account_info();
     let asset = read_asset(&asset_info)?;
     require!(

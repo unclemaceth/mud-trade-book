@@ -4,7 +4,8 @@
 //! (orderings, duplicates, a foreign-collection asset, a random-URI asset, the maker's own card)
 //! and a random give-account order. An independent model predicts success. Invariant: either
 //! nothing moved, or exactly the offer's give cards went to the taker and the passed taker cards
-//! went to the maker, and the outcome matches the model.
+//! went to the maker, the taker paid exactly the trade fee to the fee recipient, and the
+//! outcome matches the model. Cards span all three finishes; the fee is random up to the cap.
 //!
 //! Cases: `MTB_FUZZ_CASES` (default 256).
 
@@ -13,7 +14,7 @@ mod common;
 use anchor_lang::prelude::Pubkey;
 use common::*;
 use mpl_core::types::RuleSet;
-use mud_trade_book::state::Slot;
+use mud_trade_book::{state::Slot, MAX_FEE_LAMPORTS};
 use proptest::{
     prelude::*,
     test_runner::{Config, TestRunner},
@@ -23,8 +24,9 @@ use solana_signer::Signer;
 const PREFIX: &str = "https://assets.mudwater.bayc.com/m/c/";
 const POOL: usize = 6;
 
-/// Independent oracle for the URI rule (not the program's parser).
-fn oracle_card(uri: &str) -> Option<(u8, bool)> {
+/// Independent oracle for the URI rule (not the program's parser): card number and finish bit
+/// (1 base, 2 foil, 4 serialized).
+fn oracle_card(uri: &str) -> Option<(u8, u8)> {
     let rest = uri.strip_prefix(PREFIX)?;
     let (i, s) = rest.split_once('-')?;
     let ok = |p: &str| {
@@ -35,10 +37,10 @@ fn oracle_card(uri: &str) -> Option<(u8, bool)> {
     }
     let idx: u64 = i.parse().ok()?;
     let serial: u64 = s.parse().ok()?;
-    if idx > 239 || serial > u64::from(u32::MAX) {
+    if idx > 359 || serial > u64::from(u32::MAX) {
         return None;
     }
-    Some(((idx % 120 + 1) as u8, idx >= 120))
+    Some(((idx % 120 + 1) as u8, 1 << (idx / 120)))
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,8 @@ struct Case {
     /// 0 random picks; 1 honest picks; 2 honest then swap the first two; 3 honest then
     /// duplicate the first.
     mode: u8,
+    /// Trade fee in lamports, set before the fill.
+    fee: u64,
 }
 
 fn slot_spec() -> impl Strategy<Value = SlotSpec> {
@@ -72,7 +76,7 @@ fn slot_spec() -> impl Strategy<Value = SlotSpec> {
         (
             prop::collection::vec(any::<bool>(), POOL),
             prop::collection::vec(1u8..=120, 0..3),
-            1u8..=3
+            1u8..=7
         )
             .prop_map(|(include, extra, mask)| SlotSpec::Cards {
                 include,
@@ -89,16 +93,17 @@ fn case() -> impl Strategy<Value = Case> {
         "[0-9]{1,3}-[0-9]{1,11}".prop_map(|t| format!("{PREFIX}{t}")),
     ];
     (
-        prop::collection::vec(0u32..240, 1..=4),
-        prop::collection::vec(0u32..240, POOL),
+        prop::collection::vec(0u32..360, 1..=4),
+        prop::collection::vec(0u32..360, POOL),
         bad_uri,
         prop::collection::vec(slot_spec(), 1..=4),
         prop::collection::vec(0usize..POOL + 3, 0..=5),
         prop_oneof![3 => Just(0u8), 1 => 1u8..4],
         0u8..4,
+        prop_oneof![Just(0u64), Just(MAX_FEE_LAMPORTS), 1u64..=MAX_FEE_LAMPORTS],
     )
         .prop_map(
-            |(give_idx, pool_idx, bad_uri, want, pick, give_order, mode)| Case {
+            |(give_idx, pool_idx, bad_uri, want, pick, give_order, mode, fee)| Case {
                 give_idx,
                 pool_idx,
                 bad_uri,
@@ -106,6 +111,7 @@ fn case() -> impl Strategy<Value = Case> {
                 pick,
                 give_order,
                 mode,
+                fee,
             },
         )
 }
@@ -122,7 +128,7 @@ struct Tally {
 fn honest(
     want: &[Slot],
     candidates: &[Pubkey],
-    card_of: &dyn Fn(&Pubkey) -> Option<(u8, bool)>,
+    card_of: &dyn Fn(&Pubkey) -> Option<(u8, u8)>,
 ) -> Vec<Pubkey> {
     let mut out: Vec<Pubkey> = Vec::new();
     for slot in want {
@@ -130,10 +136,9 @@ fn honest(
             !out.contains(k)
                 && match slot {
                     Slot::Asset(w) => w == *k,
-                    Slot::Cards { cards, finish_mask } => card_of(k).is_some_and(|(n, foil)| {
+                    Slot::Cards { cards, finish_mask } => card_of(k).is_some_and(|(n, finish)| {
                         let i = usize::from(n - 1);
-                        cards[i / 8] & (1 << (i % 8)) != 0
-                            && finish_mask & if foil { 2 } else { 1 } != 0
+                        cards[i / 8] & (1 << (i % 8)) != 0 && finish_mask & finish != 0
                     }),
                 }
         });
@@ -169,7 +174,7 @@ fn run(c: &Case, tally: &std::cell::RefCell<Tally>) -> Result<(), TestCaseError>
         .copied()
         .chain([foreign, bad, give[0]])
         .collect();
-    let card_of = |k: &Pubkey| -> Option<(u8, bool)> {
+    let card_of = |k: &Pubkey| -> Option<(u8, u8)> {
         if let Some(i) = pool.iter().position(|p| p == k) {
             return oracle_card(&uri(c.pool_idx[i], 100 + i as u32));
         }
@@ -220,7 +225,11 @@ fn run(c: &Case, tally: &std::cell::RefCell<Tally>) -> Result<(), TestCaseError>
         Slot::Cards { cards, .. } => cards.iter().any(|b| *b != 0),
         Slot::Asset(_) => true,
     });
-    let mut ixs: Vec<_> = give.iter().map(|a| env.delegate_ix(*a, &m)).collect();
+    let offer_key = env.offer_pda(&m, 1);
+    let mut ixs: Vec<_> = give
+        .iter()
+        .map(|a| env.delegate_ix(*a, &m, &offer_key))
+        .collect();
     let exp = env.now() + DAY;
     ixs.push(env.create_offer_ix(&m, 1, &give, &want, exp));
     let maker = env.maker.insecure_clone();
@@ -273,16 +282,24 @@ fn run(c: &Case, tally: &std::cell::RefCell<Tally>) -> Result<(), TestCaseError>
         && picked.iter().all(|k| *k != foreign)
         && picked.iter().zip(&want).all(|(k, slot)| match slot {
             Slot::Asset(w) => w == k,
-            Slot::Cards { cards, finish_mask } => card_of(k).is_some_and(|(n, foil)| {
+            Slot::Cards { cards, finish_mask } => card_of(k).is_some_and(|(n, finish)| {
                 let i = usize::from(n - 1);
-                cards[i / 8] & (1 << (i % 8)) != 0 && finish_mask & if foil { 2 } else { 1 } != 0
+                cards[i / 8] & (1 << (i % 8)) != 0 && finish_mask & finish != 0
             }),
         });
 
     let mut tracked = give.clone();
     tracked.extend(&candidates[..POOL + 2]);
     env.prepare_cards(&offer, &picked);
-    let before = env.snap(&[m, t], &tracked);
+    let admin = env.admin.insecure_clone();
+    let recipient = env.fee_recipient;
+    // A funded recipient, so any fee up to the cap leaves it rent-exempt.
+    env.svm
+        .airdrop(&recipient, SOL)
+        .expect("fund fee recipient");
+    let set = env.set_fee(&admin, recipient, c.fee).res;
+    prop_assert!(set.is_ok(), "set_fee: {:?}", set);
+    let before = env.snap(&[m, t, recipient], &tracked);
     let taker = env.taker.insecure_clone();
     let ix = env.fill_ix_with(&t, &offer, &give_passed, &picked, CORE_ID);
     let res = env.send(&[ix], &taker, &[]).res;
@@ -308,7 +325,11 @@ fn run(c: &Case, tally: &std::cell::RefCell<Tally>) -> Result<(), TestCaseError>
         }
         prop_assert!(!env.exists(&offer));
         prop_assert_eq!(env.lamports(&m), before.lamports[0].1 + rent);
-        prop_assert_eq!(env.lamports(&t), before.lamports[1].1 - fee_of(&res));
+        prop_assert_eq!(
+            env.lamports(&t),
+            before.lamports[1].1 - fee_of(&res) - c.fee
+        );
+        prop_assert_eq!(env.lamports(&recipient), before.lamports[2].1 + c.fee);
     } else {
         tally.borrow_mut().fills_refused += 1;
         env.assert_nothing_moved(&before, &t, &res);

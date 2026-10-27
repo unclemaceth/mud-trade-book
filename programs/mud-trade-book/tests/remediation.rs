@@ -8,8 +8,7 @@ use common::*;
 use mpl_core::{
     instructions::{BurnV1Builder, CreateV1Builder},
     types::{
-        DataState, PermanentFreezeDelegate, Plugin, PluginAuthority, PluginAuthorityPair,
-        RuleSet,
+        DataState, PermanentFreezeDelegate, Plugin, PluginAuthority, PluginAuthorityPair, RuleSet,
     },
 };
 use mud_trade_book::{
@@ -33,8 +32,12 @@ fn week(env: &Env) -> i64 {
     env.now() + 7 * DAY
 }
 
+/// The card still carries a delegation to some address (its own offer's, or a new owner's).
 fn live(env: &Env, a: &Pubkey) -> bool {
-    env.read(a).delegate_is(&env.delegate)
+    matches!(
+        env.read(a).transfer_delegate,
+        Some(PluginAuthority::Address { .. })
+    )
 }
 
 #[track_caller]
@@ -69,7 +72,7 @@ fn g01_config_born_closed_permits_and_public() {
 
     let a = env.mint(&m, 31, 1);
     let b = env.mint(&t, 9, 1);
-    env.add_delegate(a, &maker);
+    env.add_delegate(a, &maker, &env.offer_pda(&m, 1));
     let exp = week(&env);
     let exact = [Slot::Asset(b)];
 
@@ -118,7 +121,7 @@ fn g01_config_born_closed_permits_and_public() {
         admin_before + permit_rent - fee_of(&revoked)
     );
     let c2 = env.mint(&m, 32, 2);
-    env.add_delegate(c2, &maker);
+    env.add_delegate(c2, &maker, &env.offer_pda(&m, 2));
     let res = env.create_offer(&maker, 2, &[c2], &exact, exp).res;
     assert_trade_err(&res, TradeError::NotPermitted);
     let res = env.fill(&taker, &offer, &[b]).res;
@@ -132,7 +135,9 @@ fn g01_config_born_closed_permits_and_public() {
     assert_trade_err(&env.open_public(&admin).res, TradeError::AlreadyPublic);
     assert!(env.config().public);
     let d = env.mint(&t, 10, 5);
-    let res = env.create_offer(&maker, 2, &[c2], &[Slot::Asset(d)], exp).res;
+    let res = env
+        .create_offer(&maker, 2, &[c2], &[Slot::Asset(d)], exp)
+        .res;
     assert!(res.is_ok(), "{res:#?}");
 }
 
@@ -202,7 +207,10 @@ fn g03_two_step_admin_transfer() {
     assert!(env.propose_admin(&admin, next.pubkey()).res.is_ok());
     assert_eq!(env.config().pending_admin, Some(next.pubkey()));
     assert_trade_err(&env.accept_admin(&taker).res, TradeError::NotPendingAdmin);
-    assert_trade_err(&env.accept_admin(&stranger).res, TradeError::NotPendingAdmin);
+    assert_trade_err(
+        &env.accept_admin(&stranger).res,
+        TradeError::NotPendingAdmin,
+    );
     assert!(env.set_paused(&admin, false).res.is_ok());
     assert_trade_err(&env.set_paused(&next, true).res, TradeError::NotAdmin);
 
@@ -288,7 +296,7 @@ fn g05_wrong_core_account_type_is_an_error_not_a_panic() {
     let col = env.collection;
     let a = env.mint(&m, 1, 1);
     let b = env.mint(&t, 9, 1);
-    env.add_delegate(a, &maker);
+    env.add_delegate(a, &maker, &env.offer_pda(&m, 1));
 
     let res = env
         .create_offer(&maker, 1, &[col], &[Slot::Asset(b)], week(&env))
@@ -304,9 +312,18 @@ fn g05_wrong_core_account_type_is_an_error_not_a_panic() {
     assert_trade_err(&res, TradeError::NotCoreAsset);
 
     let ix = env.create_offer_ix(&m, 2, &[a], &[cards_slot(&[10], FINISH_ALL)], week(&env));
-    assert!(env.send(&[ix], &maker, &[]).res.is_err(), "a is already listed");
+    assert!(
+        env.send(&[ix], &maker, &[]).res.is_err(),
+        "a is already listed"
+    );
     let c = env.mint(&m, 2, 1);
-    let offer = env.list(&maker, 2, &[c], &[cards_slot(&[10], FINISH_ALL)], week(&env));
+    let offer = env.list(
+        &maker,
+        2,
+        &[c],
+        &[cards_slot(&[10], FINISH_ALL)],
+        week(&env),
+    );
     let ix = env.fill_ix_with(&t, &offer, &[c], &[col], CORE_ID);
     let res = env.send(&[ix], &taker, &[]).res;
     assert_trade_err(&res, TradeError::NotCoreAsset);
@@ -380,12 +397,15 @@ fn r03_stale_close_keeps_the_new_owners_delegation() {
 
     // `a` leaves the maker; its new owner delegates it for a listing of their own.
     env.core_transfer(a, &maker, &s);
-    env.add_delegate(a, &stranger);
+    env.add_delegate(a, &stranger, &env.offer_pda(&s, 1));
     assert!(live(&env, &a));
 
     let res = env.close(&taker, &offer).res;
     assert!(res.is_ok(), "{res:#?}");
-    assert!(live(&env, &a), "close revoked a card the maker no longer owns");
+    assert!(
+        live(&env, &a),
+        "close revoked a card the maker no longer owns"
+    );
     assert_eq!(env.owner_of(&a), s);
     assert_revoked(&env, &c);
     assert_eq!(env.owner_of(&c), m);
@@ -497,12 +517,37 @@ fn r06_cancel_rejects_substitutes_and_rolls_back_revokes() {
 
     type Case = (&'static str, Vec<Pubkey>, Vec<Pubkey>, TradeError);
     let cases: Vec<Case> = vec![
-        ("one Listed short", vec![a, c], vec![la], TradeError::AccountCount),
-        ("decoy give asset", vec![a, e], vec![la, lc], TradeError::WrongAccount),
-        ("give order swapped", vec![c, a], vec![la, lc], TradeError::WrongAccount),
+        (
+            "one Listed short",
+            vec![a, c],
+            vec![la],
+            TradeError::AccountCount,
+        ),
+        (
+            "decoy give asset",
+            vec![a, e],
+            vec![la, lc],
+            TradeError::WrongAccount,
+        ),
+        (
+            "give order swapped",
+            vec![c, a],
+            vec![la, lc],
+            TradeError::WrongAccount,
+        ),
         // These fail after both revokes ran, so they also prove the revokes roll back.
-        ("Listed order swapped", vec![a, c], vec![lc, la], TradeError::BadListed),
-        ("another offer's Listed", vec![a, c], vec![la, le], TradeError::BadListed),
+        (
+            "Listed order swapped",
+            vec![a, c],
+            vec![lc, la],
+            TradeError::BadListed,
+        ),
+        (
+            "another offer's Listed",
+            vec![a, c],
+            vec![la, le],
+            TradeError::BadListed,
+        ),
     ];
     for (name, give, listed, err) in cases {
         let ix = env.cancel_ix_with(&m, &offer, &give, &listed);
@@ -510,7 +555,10 @@ fn r06_cancel_rejects_substitutes_and_rolls_back_revokes() {
         let res = env.send(&[ix], &maker, &[]).res;
         assert_trade_err(&res, err);
         env.assert_nothing_moved(&before, &m, &res);
-        assert!(live(&env, &a) && live(&env, &c), "{name}: a revoke survived");
+        assert!(
+            live(&env, &a) && live(&env, &c),
+            "{name}: a revoke survived"
+        );
         assert!(env.exists(&offer) && env.exists(&la) && env.exists(&lc));
         println!("r06 {name}: {err:?}");
     }
@@ -518,14 +566,20 @@ fn r06_cancel_rejects_substitutes_and_rolls_back_revokes() {
     let wrong_col = env.create_collection(RuleSet::None);
     let mut ix = env.cancel_ix(&m, &offer);
     ix.accounts[4].pubkey = wrong_col;
-    assert_trade_err(&env.send(&[ix], &maker, &[]).res, TradeError::WrongCollection);
+    assert_trade_err(
+        &env.send(&[ix], &maker, &[]).res,
+        TradeError::WrongCollection,
+    );
     let mut ix = env.cancel_ix(&m, &offer);
     ix.accounts[5].pubkey = system_program::ID;
     assert_trade_err(&env.send(&[ix], &maker, &[]).res, TradeError::WrongProgram);
 
     let res = env.cancel(&maker, &offer).res;
     assert!(res.is_ok(), "{res:#?}");
-    assert!(live(&env, &e) && env.exists(&other), "the other offer was touched");
+    assert!(
+        live(&env, &e) && env.exists(&other),
+        "the other offer was touched"
+    );
 }
 
 #[test]
@@ -543,10 +597,34 @@ fn r07_close_rejects_substitutes_and_rolls_back_revokes() {
 
     type Case = (&'static str, Pubkey, Vec<Pubkey>, Vec<Pubkey>, TradeError);
     let cases: Vec<Case> = vec![
-        ("maker substituted", s, vec![a, c], vec![la, lc], TradeError::WrongAccount),
-        ("one Listed short", m, vec![a, c], vec![la], TradeError::AccountCount),
-        ("give order swapped", m, vec![c, a], vec![la, lc], TradeError::WrongAccount),
-        ("Listed order swapped", m, vec![a, c], vec![lc, la], TradeError::BadListed),
+        (
+            "maker substituted",
+            s,
+            vec![a, c],
+            vec![la, lc],
+            TradeError::WrongAccount,
+        ),
+        (
+            "one Listed short",
+            m,
+            vec![a, c],
+            vec![la],
+            TradeError::AccountCount,
+        ),
+        (
+            "give order swapped",
+            m,
+            vec![c, a],
+            vec![la, lc],
+            TradeError::WrongAccount,
+        ),
+        (
+            "Listed order swapped",
+            m,
+            vec![a, c],
+            vec![lc, la],
+            TradeError::BadListed,
+        ),
     ];
     for (name, maker_key, give, listed, err) in cases {
         let ix = env.close_ix_with(&s, &offer, maker_key, &give, &listed);
@@ -554,12 +632,18 @@ fn r07_close_rejects_substitutes_and_rolls_back_revokes() {
         let res = env.send(&[ix], &stranger, &[]).res;
         assert_trade_err(&res, err);
         env.assert_nothing_moved(&before, &s, &res);
-        assert!(live(&env, &a) && live(&env, &c), "{name}: a revoke survived");
+        assert!(
+            live(&env, &a) && live(&env, &c),
+            "{name}: a revoke survived"
+        );
         println!("r07 {name}: {err:?}");
     }
     let mut ix = env.close_ix(&s, &offer);
     ix.accounts[6].pubkey = system_program::ID;
-    assert_trade_err(&env.send(&[ix], &stranger, &[]).res, TradeError::WrongProgram);
+    assert_trade_err(
+        &env.send(&[ix], &stranger, &[]).res,
+        TradeError::WrongProgram,
+    );
 
     let res = env.close(&stranger, &offer).res;
     assert!(res.is_ok(), "{res:#?}");
@@ -598,10 +682,15 @@ fn m05_late_core_failure_rolls_back_earlier_transfers() {
         .iter()
         .filter(|l| *l == &format!("Program {CORE_ID} success"))
         .count();
-    assert_eq!(core_ok, 3, "both give transfers and the first taker transfer ran");
+    assert_eq!(
+        core_ok, 3,
+        "both give transfers and the first taker transfer ran"
+    );
     env.assert_nothing_moved(&before, &t, &res);
     assert!(env.exists(&offer));
-    assert!(give.iter().all(|a| env.exists(&env.listed_pda(a)) && live(&env, a)));
+    assert!(give
+        .iter()
+        .all(|a| env.exists(&env.listed_pda(a)) && live(&env, a)));
 }
 
 #[test]
@@ -616,18 +705,22 @@ fn l04_fill_listed_order_and_count() {
     let exp = week(&env);
     let offer = env.list(&maker, 1, &[a, c], &[Slot::Asset(b)], exp);
     env.list(&maker, 2, &[e], &[Slot::Asset(b)], exp);
-    // FillOffer has 9 named accounts; then 2 give, 1 taker, 2 Listed.
+    // FillOffer has 11 named accounts; then 2 give, 1 taker, 2 Listed.
     let (la, lc, le) = (env.listed_pda(&a), env.listed_pda(&c), env.listed_pda(&e));
 
     type Case = (&'static str, Vec<Pubkey>, TradeError);
     let cases: Vec<Case> = vec![
         ("Listed order swapped", vec![lc, la], TradeError::BadListed),
-        ("another offer's Listed", vec![la, le], TradeError::BadListed),
+        (
+            "another offer's Listed",
+            vec![la, le],
+            TradeError::BadListed,
+        ),
         ("one Listed short", vec![la], TradeError::AccountCount),
     ];
     for (name, listed, err) in cases {
         let mut ix = env.fill_ix_with(&t, &offer, &[a, c], &[b], CORE_ID);
-        ix.accounts.truncate(12);
+        ix.accounts.truncate(14);
         ix.accounts.extend(
             listed
                 .iter()
@@ -651,18 +744,22 @@ fn l04_create_listed_order_and_count() {
     let a = env.mint(&m, 1, 1);
     let c = env.mint(&m, 2, 1);
     let b = env.mint(&t, 9, 1);
-    env.add_delegate(a, &maker);
-    env.add_delegate(c, &maker);
+    env.add_delegate(a, &maker, &env.offer_pda(&m, 1));
+    env.add_delegate(c, &maker, &env.offer_pda(&m, 1));
     let exp = week(&env);
     let (la, lc) = (env.listed_pda(&a), env.listed_pda(&c));
-    // CreateOffer has 6 named accounts; then 2 give, 2 Listed.
+    // CreateOffer has 7 named accounts; then 2 give, 2 Listed.
     let cases: Vec<(&str, Vec<Pubkey>, TradeError)> = vec![
-        ("Listed order swapped", vec![c, a, lc, la], TradeError::WrongAccount),
+        (
+            "Listed order swapped",
+            vec![c, a, lc, la],
+            TradeError::WrongAccount,
+        ),
         ("one Listed short", vec![a, c, la], TradeError::AccountCount),
     ];
     for (name, rest, err) in cases {
         let mut ix = env.create_offer_ix(&m, 1, &[a, c], &[Slot::Asset(b)], exp);
-        ix.accounts.truncate(6);
+        ix.accounts.truncate(7);
         ix.accounts.extend(
             rest.iter()
                 .map(|k| anchor_lang::solana_program::instruction::AccountMeta::new(*k, false)),
@@ -693,7 +790,8 @@ fn l04_prefunded_listed_is_claimed_and_refunded() {
     for (i, (name, prefund)) in cases.into_iter().enumerate() {
         let a = env.mint(&m, i as u32 + 1, 1);
         let b = env.mint(&t, 9, i as u32 + 1);
-        env.add_delegate(a, &maker);
+        let id = i as u64 + 1;
+        env.add_delegate(a, &maker, &env.offer_pda(&m, id));
         let l = env.listed_pda(&a);
         env.svm
             .set_account(
@@ -707,7 +805,6 @@ fn l04_prefunded_listed_is_claimed_and_refunded() {
                 },
             )
             .unwrap();
-        let id = 10 + i as u64;
         let before = env.lamports(&m);
         let res = env
             .create_offer(&maker, id, &[a], &[Slot::Asset(b)], week(&env))
@@ -721,7 +818,10 @@ fn l04_prefunded_listed_is_claimed_and_refunded() {
         let paid = before - env.lamports(&m);
         assert_eq!(
             paid,
-            fee_of(&res) + env.lamports(&offer) + listed_rent.saturating_sub(prefund),
+            fee_of(&res)
+                + env.lamports(&offer)
+                + listed_rent.saturating_sub(prefund)
+                + if i == 0 { env.maker_state_rent() } else { 0 },
             "{name}: the maker paid more than the top-up"
         );
 
@@ -736,24 +836,89 @@ fn l04_prefunded_listed_is_claimed_and_refunded() {
             before + offer_rent + held - fee_of(&res),
             "{name}: refund"
         );
-        println!("l04 prefunded {name} ({prefund}): maker topped up {}", listed_rent.saturating_sub(prefund));
+        println!(
+            "l04 prefunded {name} ({prefund}): maker topped up {}",
+            listed_rent.saturating_sub(prefund)
+        );
     }
 }
 
 #[test]
-fn l03_offer_id_reuse_is_a_new_instance() {
+fn l03_offer_id_is_never_reused() {
     let mut env = Env::new(RuleSet::None);
     let (_admin, maker, _taker, _stranger) = keys(&env);
     let (m, t) = (maker.pubkey(), env.taker.pubkey());
     let a = env.mint(&m, 1, 1);
     let b = env.mint(&t, 9, 1);
+    assert_eq!(env.last_offer_id(&m), 0);
+
+    // The first id is 1: 0 and 2 are refused and nothing is created.
+    for id in [0, 2] {
+        env.add_delegate(a, &maker, &env.offer_pda(&m, id));
+        let res = env
+            .create_offer(&maker, id, &[a], &[Slot::Asset(b)], week(&env))
+            .res;
+        assert_trade_err(&res, TradeError::OfferIdNotNext);
+        assert!(!env.exists(&env.offer_pda(&m, id)));
+        env.revoke_delegate(a, &maker);
+    }
+    assert!(!env.exists(&env.maker_state_pda(&m)));
+
     let offer = env.list(&maker, 1, &[a], &[Slot::Asset(b)], week(&env));
-    let first = env.offer(&offer).created_slot;
+    assert_eq!(env.last_offer_id(&m), 1);
     assert!(env.cancel(&maker, &offer).res.is_ok());
-    env.warp_to(env.now() + 1);
-    let again = env.list(&maker, 1, &[a], &[Slot::Asset(b)], week(&env));
-    assert_eq!(again, offer, "same maker and id give the same address");
-    assert!(env.offer(&again).created_slot > first);
+
+    // Cancelled, the address is free, but id 1 is never created again: not in the same slot,
+    // not later.
+    env.add_delegate(a, &maker, &offer);
+    for _ in 0..2 {
+        let res = env
+            .create_offer(&maker, 1, &[a], &[Slot::Asset(b)], week(&env))
+            .res;
+        assert_trade_err(&res, TradeError::OfferIdNotNext);
+        assert!(!env.exists(&offer));
+        env.warp_to(env.now() + 1);
+    }
+    env.revoke_delegate(a, &maker);
+
+    let next = env.list(&maker, 2, &[a], &[Slot::Asset(b)], week(&env));
+    assert_ne!(next, offer, "a new id is a new address and a new delegate");
+    assert_eq!(env.last_offer_id(&m), 2);
+
+    // Each maker counts on their own.
+    let stranger = env.stranger.insecure_clone();
+    let s = stranger.pubkey();
+    let c = env.mint(&s, 2, 1);
+    env.list(&stranger, 1, &[c], &[Slot::Asset(b)], week(&env));
+    assert_eq!((env.last_offer_id(&m), env.last_offer_id(&s)), (2, 1));
+}
+
+/// The audit's same-slot case inside one transaction: create, cancel, and create again with the
+/// same id. The second create is refused, so the whole transaction rolls back.
+#[test]
+fn l03_same_transaction_recreate_is_refused() {
+    let mut env = Env::new(RuleSet::None);
+    let (_admin, maker, _taker, _stranger) = keys(&env);
+    let (m, t) = (maker.pubkey(), env.taker.pubkey());
+    let a = env.mint(&m, 1, 1);
+    let b = env.mint(&t, 9, 1);
+    let exp = week(&env);
+    let offer = env.offer_pda(&m, 1);
+    let listed = env.listed_pda(&a);
+    // A revoked plugin already on the card, so both approvals below are Approve, not Add.
+    env.add_delegate(a, &maker, &offer);
+    env.revoke_delegate(a, &maker);
+    let ixs = vec![
+        env.delegate_ix(a, &m, &offer),
+        env.create_offer_ix(&m, 1, &[a], &[Slot::Asset(b)], exp),
+        env.cancel_ix_with(&m, &offer, &[a], &[listed]),
+        env.delegate_ix(a, &m, &offer),
+        env.create_offer_ix(&m, 1, &[a], &[Slot::Asset(b)], exp),
+    ];
+    let res = env.send(&ixs, &maker, &[]).res;
+    assert_trade_err(&res, TradeError::OfferIdNotNext);
+    assert!(!env.exists(&offer));
+    assert_eq!(env.last_offer_id(&m), 0);
 }
 
 trait ListedBytes {

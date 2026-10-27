@@ -146,8 +146,14 @@ fn g01_add_card_root_is_admin_only_and_append_only() {
 
     let res = env.add_card_root(&stranger, [7; 32], 10).res;
     assert_trade_err(&res, TradeError::NotAdmin);
-    assert_trade_err(&env.add_card_root(&admin, [0; 32], 10).res, TradeError::BadRoot);
-    assert_trade_err(&env.add_card_root(&admin, [7; 32], 0).res, TradeError::BadRoot);
+    assert_trade_err(
+        &env.add_card_root(&admin, [0; 32], 10).res,
+        TradeError::BadRoot,
+    );
+    assert_trade_err(
+        &env.add_card_root(&admin, [7; 32], 0).res,
+        TradeError::BadRoot,
+    );
     assert_eq!(env.config().root_count, 0);
 
     assert!(env.add_card_root(&admin, [7; 32], 10).res.is_ok());
@@ -162,10 +168,11 @@ fn g01_add_card_root_is_admin_only_and_append_only() {
     }
     assert_eq!(env.config().root_count, 2);
     let acc = env.svm.get_account(&env.root_pda(1)).unwrap();
-    let root = <mud_trade_book::state::CardRoot as anchor_lang::AccountDeserialize>::try_deserialize(
-        &mut &acc.data[..],
-    )
-    .unwrap();
+    let root =
+        <mud_trade_book::state::CardRoot as anchor_lang::AccountDeserialize>::try_deserialize(
+            &mut &acc.data[..],
+        )
+        .unwrap();
     assert_eq!((root.root, root.index, root.leaves), ([8; 32], 1, 20));
 }
 
@@ -181,18 +188,42 @@ fn g02_register_card_happy_path_and_once_only() {
     let (index, proofs) = env.publish_root(&[(b, 14, FINISH_FOIL), (c, 1, FINISH_BASE)]);
 
     // Anyone can register, not only the owner.
-    let ix = env.register_card_ix(&stranger.pubkey(), index, &b, 14, FINISH_FOIL, proofs[0].clone());
+    let ix = env.register_card_ix(
+        &stranger.pubkey(),
+        index,
+        &b,
+        14,
+        FINISH_FOIL,
+        proofs[0].clone(),
+    );
     let res = env.send(std::slice::from_ref(&ix), &stranger, &[]).res;
     assert!(res.is_ok(), "{res:#?}");
     let rec = env.card_record(&b).unwrap();
-    assert_eq!((rec.card_no, rec.finish, rec.root_index), (14, FINISH_FOIL, index));
+    assert_eq!(
+        (rec.card_no, rec.finish, rec.root_index),
+        (14, FINISH_FOIL, index)
+    );
 
     // A second registration, under any root, is refused (the record already exists).
     let admin = env.admin.insecure_clone();
-    let ix = env.register_card_ix(&admin.pubkey(), index, &b, 14, FINISH_FOIL, proofs[0].clone());
+    let ix = env.register_card_ix(
+        &admin.pubkey(),
+        index,
+        &b,
+        14,
+        FINISH_FOIL,
+        proofs[0].clone(),
+    );
     assert!(env.send(&[ix], &admin, &[]).res.is_err());
     let (index2, proofs2) = env.publish_root(&[(b, 14, FINISH_FOIL)]);
-    let ix = env.register_card_ix(&stranger.pubkey(), index2, &b, 14, FINISH_FOIL, proofs2[0].clone());
+    let ix = env.register_card_ix(
+        &stranger.pubkey(),
+        index2,
+        &b,
+        14,
+        FINISH_FOIL,
+        proofs2[0].clone(),
+    );
     assert!(env.send(&[ix], &stranger, &[]).res.is_err());
     assert_eq!(env.card_record(&b).unwrap().root_index, index);
 }
@@ -218,14 +249,46 @@ fn g03_register_refuses_every_disagreement() {
     let cfg = env.config;
     type Case = (&'static str, Instruction, TradeError);
     let cases: Vec<Case> = vec![
-        ("wrong card number", env.register_card_ix(&p, index, &b, 11, FINISH_BASE, pb.clone()), TradeError::CardMismatch),
-        ("wrong finish", env.register_card_ix(&p, index, &b, 10, FINISH_FOIL, pb.clone()), TradeError::CardMismatch),
-        ("finish not a single bit", env.register_card_ix(&p, index, &b, 10, FINISH_ALL, pb.clone()), TradeError::CardMismatch),
-        ("another leaf's proof", env.register_card_ix(&p, index, &b, 10, FINISH_BASE, proofs[1].clone()), TradeError::BadProof),
-        ("asset not in the root", env.register_card_ix(&p, index, &unlisted, 10, FINISH_BASE, pb.clone()), TradeError::BadProof),
-        ("proof too long", env.register_card_ix(&p, index, &b, 10, FINISH_BASE, vec![[1; 32]; 25]), TradeError::ProofTooLong),
-        ("another collection", env.register_card_ix(&p, index, &foreign, 10, FINISH_BASE, proofs[2].clone()), TradeError::WrongCollection),
-        ("not a Core asset", env.register_card_ix(&p, index, &cfg, 10, FINISH_BASE, pb.clone()), TradeError::NotCoreAsset),
+        (
+            "wrong card number",
+            env.register_card_ix(&p, index, &b, 11, FINISH_BASE, pb.clone()),
+            TradeError::CardMismatch,
+        ),
+        (
+            "wrong finish",
+            env.register_card_ix(&p, index, &b, 10, FINISH_FOIL, pb.clone()),
+            TradeError::CardMismatch,
+        ),
+        (
+            "finish not a single bit",
+            env.register_card_ix(&p, index, &b, 10, FINISH_ALL, pb.clone()),
+            TradeError::CardMismatch,
+        ),
+        (
+            "another leaf's proof",
+            env.register_card_ix(&p, index, &b, 10, FINISH_BASE, proofs[1].clone()),
+            TradeError::BadProof,
+        ),
+        (
+            "asset not in the root",
+            env.register_card_ix(&p, index, &unlisted, 10, FINISH_BASE, pb.clone()),
+            TradeError::BadProof,
+        ),
+        (
+            "proof too long",
+            env.register_card_ix(&p, index, &b, 10, FINISH_BASE, vec![[1; 32]; 25]),
+            TradeError::ProofTooLong,
+        ),
+        (
+            "another collection",
+            env.register_card_ix(&p, index, &foreign, 10, FINISH_BASE, proofs[2].clone()),
+            TradeError::WrongCollection,
+        ),
+        (
+            "not a Core asset",
+            env.register_card_ix(&p, index, &cfg, 10, FINISH_BASE, pb.clone()),
+            TradeError::NotCoreAsset,
+        ),
     ];
     for (name, ix, err) in cases {
         let res = env.send(&[ix], &payer, &[]).res;
@@ -252,9 +315,23 @@ fn g04_root_and_uri_must_agree() {
     // The admin publishes a root that lies about a card: card 10 listed as card 120.
     let b = env.mint(&t, base(10), 1);
     let (index, proofs) = env.publish_root(&[(b, 120, FINISH_BASE)]);
-    let ix = env.register_card_ix(&admin.pubkey(), index, &b, 120, FINISH_BASE, proofs[0].clone());
+    let ix = env.register_card_ix(
+        &admin.pubkey(),
+        index,
+        &b,
+        120,
+        FINISH_BASE,
+        proofs[0].clone(),
+    );
     assert_trade_err(&env.send(&[ix], &admin, &[]).res, TradeError::CardMismatch);
-    let ix = env.register_card_ix(&admin.pubkey(), index, &b, 10, FINISH_BASE, proofs[0].clone());
+    let ix = env.register_card_ix(
+        &admin.pubkey(),
+        index,
+        &b,
+        10,
+        FINISH_BASE,
+        proofs[0].clone(),
+    );
     assert_trade_err(&env.send(&[ix], &admin, &[]).res, TradeError::BadProof);
     assert!(env.card_record(&b).is_none());
 }
@@ -273,14 +350,26 @@ fn g05_record_fixes_identity_against_later_uri_changes() {
     set_uri(&mut env, b, &uri(base(120), 1));
 
     let a = env.mint(&m, base(32), 1);
-    let wants_120 = env.list(&maker, 1, &[a], &[cards_slot(&[120], FINISH_ALL)], week(&env));
+    let wants_120 = env.list(
+        &maker,
+        1,
+        &[a],
+        &[cards_slot(&[120], FINISH_ALL)],
+        week(&env),
+    );
     let before = env.snap(&wallets(&env), &[a, b]);
     let res = env.fill(&taker, &wants_120, &[b]).res;
     assert_trade_err(&res, TradeError::SlotMismatch);
     env.assert_nothing_moved(&before, &t, &res);
     assert!(env.cancel(&maker, &wants_120).res.is_ok());
 
-    let wants_10 = env.list(&maker, 2, &[a], &[cards_slot(&[10], FINISH_BASE)], week(&env));
+    let wants_10 = env.list(
+        &maker,
+        2,
+        &[a],
+        &[cards_slot(&[10], FINISH_BASE)],
+        week(&env),
+    );
     let res = env.fill(&taker, &wants_10, &[b]).res;
     assert!(res.is_ok(), "{res:#?}");
     assert_eq!(env.owner_of(&a), t);
@@ -298,13 +387,23 @@ fn g06_fill_refuses_bad_records() {
     let twin = env.mint(&t, base(10), 2);
     let unregistered = env.mint(&t, base(10), 3);
     env.register_cards(&[b, twin]);
-    let offer = env.list(&maker, 1, &[a], &[cards_slot(&[10], FINISH_ALL)], week(&env));
-    // 9 named accounts, then give, taker asset, Listed, then the record.
-    let record_at = 12;
+    let offer = env.list(
+        &maker,
+        1,
+        &[a],
+        &[cards_slot(&[10], FINISH_ALL)],
+        week(&env),
+    );
+    // 11 named accounts, then give, taker asset, Listed, then the record.
+    let record_at = 14;
 
     let cases: Vec<(&str, Pubkey, Pubkey)> = vec![
         ("another card's record", b, env.card_pda(&twin)),
-        ("unregistered card", unregistered, env.card_pda(&unregistered)),
+        (
+            "unregistered card",
+            unregistered,
+            env.card_pda(&unregistered),
+        ),
         ("program account of another type", b, env.offer_pda(&m, 1)),
         ("Config", b, env.config),
         ("system account", b, t),
@@ -325,7 +424,8 @@ fn g06_fill_refuses_bad_records() {
     ix.accounts.pop();
     assert_trade_err(&env.send(&[ix], &taker, &[]).res, TradeError::AccountCount);
     let mut ix = env.fill_ix_with(&t, &offer, &[a], &[b], CORE_ID);
-    ix.accounts.push(AccountMeta::new_readonly(env.card_pda(&twin), false));
+    ix.accounts
+        .push(AccountMeta::new_readonly(env.card_pda(&twin), false));
     assert_trade_err(&env.send(&[ix], &taker, &[]).res, TradeError::AccountCount);
 
     let res = env.fill(&taker, &offer, &[b]).res;
@@ -385,10 +485,22 @@ fn g08_registration_survives_owner_change_and_records_are_permanent() {
     // The card trades into the maker's wallet and back out again on another offer: one record
     // serves every fill.
     let a = env.mint(&m, base(32), 1);
-    let offer = env.list(&maker, 1, &[a], &[cards_slot(&[10], FINISH_ALL)], week(&env));
+    let offer = env.list(
+        &maker,
+        1,
+        &[a],
+        &[cards_slot(&[10], FINISH_ALL)],
+        week(&env),
+    );
     assert!(env.fill(&taker, &offer, &[b]).res.is_ok());
     let c = env.mint(&t, base(33), 1);
-    let offer = env.list(&taker, 1, &[c], &[cards_slot(&[10], FINISH_ALL)], week(&env));
+    let offer = env.list(
+        &taker,
+        1,
+        &[c],
+        &[cards_slot(&[10], FINISH_ALL)],
+        week(&env),
+    );
     let stranger = env.stranger.insecure_clone();
     let s = stranger.pubkey();
     env.core_transfer(b, &maker, &s);

@@ -72,6 +72,18 @@ pub mod mud_trade_book {
         instructions::admin_config::handle_set_cards_enabled(ctx, enabled)
     }
 
+    /// Admin only, once. Creates the trade fee account. Fills fail until it exists. The
+    /// recipient account must be a funded system wallet.
+    pub fn init_fee_config(ctx: Context<InitFeeConfig>, lamports: u64) -> Result<()> {
+        instructions::fee_config::handle_init_fee_config(ctx, lamports)
+    }
+
+    /// Admin only. Changes the fee recipient and amount, at most `MAX_FEE_LAMPORTS`. The
+    /// recipient account must be a funded system wallet.
+    pub fn set_fee(ctx: Context<SetFee>, lamports: u64) -> Result<()> {
+        instructions::fee_config::handle_set_fee(ctx, lamports)
+    }
+
     /// Admin only, append only. Publishes a registry snapshot root at the next index.
     pub fn add_card_root(ctx: Context<AddCardRoot>, root: [u8; 32], leaves: u32) -> Result<()> {
         instructions::card_registry::handle_add_card_root(ctx, root, leaves)
@@ -98,12 +110,12 @@ pub mod mud_trade_book {
         instructions::create_offer::handle_create_offer(ctx, offer_id, give, want, expires_at)
     }
 
-    /// The only instruction that moves a card.
-    pub fn fill_offer<'info>(ctx: Context<'info, FillOffer<'info>>) -> Result<()> {
-        instructions::fill_offer::handle_fill_offer(ctx)
+    /// The only instruction that moves a card. The taker pays the trade fee, at most `max_fee`.
+    pub fn fill_offer<'info>(ctx: Context<'info, FillOffer<'info>>, max_fee: u64) -> Result<()> {
+        instructions::fill_offer::handle_fill_offer(ctx, max_fee)
     }
 
-    /// Maker only. Revokes the Trade Book's delegation on every give card it still holds.
+    /// Maker only. Revokes this offer's delegation on every give card the maker still holds.
     pub fn cancel_offer<'info>(ctx: Context<'info, CancelOffer<'info>>) -> Result<()> {
         instructions::cancel_offer::handle_cancel_offer(ctx)
     }

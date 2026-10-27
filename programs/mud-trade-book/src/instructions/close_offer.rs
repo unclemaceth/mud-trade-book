@@ -28,8 +28,8 @@ pub struct CloseOffer<'info> {
     pub maker: UncheckedAccount<'info>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
-    /// CHECK: PDA with no data; signs the Core revokes.
-    #[account(seeds = [DELEGATE_SEED], bump)]
+    /// CHECK: this offer's delegate PDA, no data; signs the Core revokes.
+    #[account(seeds = [DELEGATE_SEED, offer.key().as_ref()], bump)]
     pub delegate: UncheckedAccount<'info>,
     /// CHECK: must be the configured collection (Core-owned, checked at init). Writable only
     /// because Core's revoke marks it writable; this program never writes it.
@@ -42,19 +42,22 @@ pub struct CloseOffer<'info> {
 }
 
 /// Anyone may close an offer that is expired or stale (a give card left the maker, left the
-/// collection, or lost its delegation). Works while paused. Remaining accounts: the give assets
-/// (offer order), then their `Listed` PDAs (offer order). Each give asset key must match the
-/// offer, so staleness cannot be faked with a substitute account. Give cards still delegated
-/// for this offer are revoked, so a stranger's cleanup leaves no delegation behind.
+/// collection, or lost this offer's delegation). Works while paused. Remaining accounts: the
+/// give assets (offer order), their `Listed` PDAs (offer order), then the current collection of
+/// any give card that left the configured one (writable, any order, at most four). Each give
+/// asset key must match the offer, so staleness cannot be faked with a substitute account. Give
+/// cards still delegated for this offer are revoked, so a stranger's cleanup leaves no
+/// delegation behind.
 pub fn handle_close_offer<'info>(ctx: Context<'info, CloseOffer<'info>>) -> Result<()> {
     let offer = &ctx.accounts.offer;
     let n = offer.give.len();
-    let expected_len = n.checked_mul(2).ok_or(TradeError::Overflow)?;
+    let fixed = n.checked_mul(2).ok_or(TradeError::Overflow)?;
     require!(
-        ctx.remaining_accounts.len() == expected_len,
+        ctx.remaining_accounts.len() >= fixed,
         TradeError::AccountCount
     );
-    let (give_infos, listed_infos) = ctx.remaining_accounts.split_at(n);
+    let (give_infos, rest) = ctx.remaining_accounts.split_at(n);
+    let (listed_infos, other_collections) = rest.split_at(n);
 
     for (key, info) in offer.give.iter().zip(give_infos) {
         require_keys_eq!(*info.key, *key, TradeError::WrongAccount);
@@ -71,13 +74,16 @@ pub fn handle_close_offer<'info>(ctx: Context<'info, CloseOffer<'info>>) -> Resu
         TradeError::NotExpiredOrStale
     );
 
+    let offer_key = offer.key();
     let revoked = revoke_listed_delegations(
         &offer.give,
         give_infos,
         ReleaseAccounts {
+            offer: &offer_key,
             maker: &offer.maker,
             collection_key: &collection,
             collection: &ctx.accounts.collection.to_account_info(),
+            other_collections,
             core_program: &ctx.accounts.core_program.to_account_info(),
             payer: &ctx.accounts.closer.to_account_info(),
             delegate: &ctx.accounts.delegate.to_account_info(),
@@ -86,7 +92,6 @@ pub fn handle_close_offer<'info>(ctx: Context<'info, CloseOffer<'info>>) -> Resu
         },
     )?;
 
-    let offer_key = offer.key();
     let maker_info = ctx.accounts.maker.to_account_info();
     for (key, info) in offer.give.iter().zip(listed_infos) {
         close_listed(info, key, &offer_key, &maker_info, ctx.program_id)?;

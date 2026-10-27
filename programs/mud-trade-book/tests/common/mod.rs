@@ -92,8 +92,11 @@ pub struct Env {
     pub taker: Keypair,
     pub stranger: Keypair,
     pub collection: Pubkey,
-    pub delegate: Pubkey,
+    /// The v1 shared delegate `["delegate"]`. v2 never signs as it; kept to prove that.
+    pub legacy_delegate: Pubkey,
     pub config: Pubkey,
+    pub fee: Pubkey,
+    pub fee_recipient: Pubkey,
 }
 
 pub struct Sent {
@@ -121,10 +124,12 @@ impl Env {
     /// left exactly as `init_config` writes it (paused, permit-only, exact wants only).
     pub fn raw(rule_set: RuleSet) -> Self {
         let mut env = Self::bare(rule_set);
-        let res = env
-            .init_config(&env.admin.insecure_clone(), env.collection)
-            .res;
+        let admin = env.admin.insecure_clone();
+        let res = env.init_config(&admin, env.collection).res;
         assert!(res.is_ok(), "init_config: {res:?}");
+        let recipient = env.fee_recipient;
+        let res = env.init_fee_config(&admin, recipient, 0).res;
+        assert!(res.is_ok(), "init_fee_config: {res:?}");
         env
     }
 
@@ -160,10 +165,14 @@ impl Env {
         for k in [&admin, &maker, &taker, &stranger] {
             svm.airdrop(&k.pubkey(), 100 * SOL).expect("airdrop");
         }
+        // A funded system wallet, as `init_fee_config` requires.
+        let fee_recipient = Keypair::new().pubkey();
+        svm.airdrop(&fee_recipient, SOL).expect("airdrop");
         set_upgrade_authority(&mut svm, &program_id, &admin.pubkey());
 
-        let delegate = Pubkey::find_program_address(&[b"delegate"], &program_id).0;
+        let legacy_delegate = Pubkey::find_program_address(&[b"delegate"], &program_id).0;
         let config = Pubkey::find_program_address(&[b"config"], &program_id).0;
+        let fee = Pubkey::find_program_address(&[b"fee"], &program_id).0;
         let mut env = Env {
             svm,
             program_id,
@@ -172,8 +181,10 @@ impl Env {
             taker,
             stranger,
             collection: Pubkey::default(),
-            delegate,
+            legacy_delegate,
             config,
+            fee,
+            fee_recipient,
         };
         env.collection = env.create_collection(rule_set);
         env
@@ -266,47 +277,77 @@ impl Env {
         self.mint_in(col, owner, &uri(idx, serial))
     }
 
-    /// Points the card's TransferDelegate at our PDA. A card that was ever transferred keeps the
-    /// plugin with its authority reset to the owner, so it needs Approve, not Add (Core 0xF).
-    pub fn delegate_ix(&self, asset: Pubkey, owner: &Pubkey) -> Instruction {
+    /// The transfer delegate of one offer: `["delegate", offer]`.
+    pub fn delegate_of(&self, offer: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(&[b"delegate", offer.as_ref()], &self.program_id).0
+    }
+
+    /// Points the card's TransferDelegate at `delegate`. A card that was ever transferred keeps
+    /// the plugin with its authority reset to the owner, so it needs Approve, not Add (Core 0xF).
+    pub fn approve_ix(&self, asset: Pubkey, owner: &Pubkey, delegate: Pubkey) -> Instruction {
+        let collection = self.read(&asset).collection;
         if self.read(&asset).transfer_delegate.is_some() {
             return ApprovePluginAuthorityV1Builder::new()
                 .asset(asset)
-                .collection(Some(self.collection))
+                .collection(collection)
                 .payer(*owner)
                 .authority(Some(*owner))
                 .plugin_type(PluginType::TransferDelegate)
-                .new_authority(PluginAuthority::Address {
-                    address: self.delegate,
-                })
+                .new_authority(PluginAuthority::Address { address: delegate })
                 .instruction();
         }
         AddPluginV1Builder::new()
             .asset(asset)
-            .collection(Some(self.collection))
+            .collection(collection)
             .payer(*owner)
             .authority(Some(*owner))
             .plugin(Plugin::TransferDelegate(TransferDelegate {}))
-            .init_authority(PluginAuthority::Address {
-                address: self.delegate,
-            })
+            .init_authority(PluginAuthority::Address { address: delegate })
             .instruction()
     }
 
-    pub fn add_delegate(&mut self, asset: Pubkey, owner: &Keypair) {
-        let ix = self.delegate_ix(asset, &owner.pubkey());
+    /// Approves the delegate of `offer`, the PDA at `[maker, offer_id]`.
+    pub fn delegate_ix(&self, asset: Pubkey, owner: &Pubkey, offer: &Pubkey) -> Instruction {
+        self.approve_ix(asset, owner, self.delegate_of(offer))
+    }
+
+    pub fn add_delegate(&mut self, asset: Pubkey, owner: &Keypair, offer: &Pubkey) {
+        let ix = self.delegate_ix(asset, &owner.pubkey(), offer);
         let res = self.send(&[ix], owner, &[]).res;
         assert!(res.is_ok(), "add delegate: {res:?}");
     }
 
-    pub fn revoke_delegate(&mut self, asset: Pubkey, owner: &Keypair) {
-        let ix = RevokePluginAuthorityV1Builder::new()
+    /// True if the card is delegated to `offer`'s delegate.
+    pub fn delegated_to(&self, asset: &Pubkey, offer: &Pubkey) -> bool {
+        self.read(asset).delegate_is(&self.delegate_of(offer))
+    }
+
+    pub fn revoke_ix(&self, asset: Pubkey, owner: &Pubkey) -> Instruction {
+        RevokePluginAuthorityV1Builder::new()
             .asset(asset)
-            .collection(Some(self.collection))
-            .payer(owner.pubkey())
-            .authority(Some(owner.pubkey()))
+            .collection(self.read(&asset).collection)
+            .payer(*owner)
+            .authority(Some(*owner))
             .plugin_type(PluginType::TransferDelegate)
-            .instruction();
+            .instruction()
+    }
+
+    /// Core refuses to re-approve a delegated plugin (CannotRedelegate, 0x1B), so moving a
+    /// delegation from one address to another is a revoke then an approve.
+    pub fn redelegate_ixs(
+        &self,
+        asset: Pubkey,
+        owner: &Pubkey,
+        delegate: Pubkey,
+    ) -> Vec<Instruction> {
+        vec![
+            self.revoke_ix(asset, owner),
+            self.approve_ix(asset, owner, delegate),
+        ]
+    }
+
+    pub fn revoke_delegate(&mut self, asset: Pubkey, owner: &Keypair) {
+        let ix = self.revoke_ix(asset, &owner.pubkey());
         let res = self.send(&[ix], owner, &[]).res;
         assert!(res.is_ok(), "revoke delegate: {res:?}");
     }
@@ -352,6 +393,25 @@ impl Env {
         .0
     }
 
+    pub fn maker_state_pda(&self, maker: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(&[b"maker", maker.as_ref()], &self.program_id).0
+    }
+
+    /// Rent of a `MakerState`, which a maker's first offer pays once.
+    pub fn maker_state_rent(&self) -> u64 {
+        self.svm.minimum_balance_for_rent_exemption(
+            8 + <mud_trade_book::state::MakerState as anchor_lang::Space>::INIT_SPACE,
+        )
+    }
+
+    /// The maker's last offer id, 0 before their first offer.
+    pub fn last_offer_id(&self, maker: &Pubkey) -> u64 {
+        self.svm
+            .get_account(&self.maker_state_pda(maker))
+            .and_then(|a| mud_trade_book::state::MakerState::try_deserialize(&mut &a.data[..]).ok())
+            .map_or(0, |m| m.last_offer_id)
+    }
+
     pub fn listed_pda(&self, asset: &Pubkey) -> Pubkey {
         Pubkey::find_program_address(&[b"listed", asset.as_ref()], &self.program_id).0
     }
@@ -392,7 +452,13 @@ impl Env {
         Some((id.card_no, id.finish.bit()))
     }
 
-    pub fn add_card_root_ix(&self, signer: &Pubkey, index: u16, root: [u8; 32], leaves: u32) -> Instruction {
+    pub fn add_card_root_ix(
+        &self,
+        signer: &Pubkey,
+        index: u16,
+        root: [u8; 32],
+        leaves: u32,
+    ) -> Instruction {
         Instruction::new_with_bytes(
             self.program_id,
             &mud_trade_book::instruction::AddCardRoot { root, leaves }.data(),
@@ -448,7 +514,9 @@ impl Env {
         let tree = Tree::new(entries);
         let index = self.config().root_count;
         let admin = self.admin.insecure_clone();
-        let res = self.add_card_root(&admin, tree.root(), entries.len() as u32).res;
+        let res = self
+            .add_card_root(&admin, tree.root(), entries.len() as u32)
+            .res;
         assert!(res.is_ok(), "add_card_root: {res:#?}");
         let proofs = (0..entries.len()).map(|i| tree.proof(i)).collect();
         (index, proofs)
@@ -481,6 +549,42 @@ impl Env {
     pub fn config(&self) -> mud_trade_book::state::Config {
         let acc = self.svm.get_account(&self.config).expect("config exists");
         mud_trade_book::state::Config::try_deserialize(&mut &acc.data[..]).expect("config decodes")
+    }
+
+    pub fn fee_config(&self) -> Option<mud_trade_book::state::FeeConfig> {
+        let acc = self.svm.get_account(&self.fee)?;
+        mud_trade_book::state::FeeConfig::try_deserialize(&mut &acc.data[..]).ok()
+    }
+
+    pub fn init_fee_config(&mut self, signer: &Keypair, recipient: Pubkey, lamports: u64) -> Sent {
+        let ix = Instruction::new_with_bytes(
+            self.program_id,
+            &mud_trade_book::instruction::InitFeeConfig { lamports }.data(),
+            mud_trade_book::accounts::InitFeeConfig {
+                admin: signer.pubkey(),
+                config: self.config,
+                fee_config: self.fee,
+                recipient,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        );
+        self.send(&[ix], signer, &[])
+    }
+
+    pub fn set_fee(&mut self, signer: &Keypair, recipient: Pubkey, lamports: u64) -> Sent {
+        let ix = Instruction::new_with_bytes(
+            self.program_id,
+            &mud_trade_book::instruction::SetFee { lamports }.data(),
+            mud_trade_book::accounts::SetFee {
+                admin: signer.pubkey(),
+                config: self.config,
+                fee_config: self.fee,
+                recipient,
+            }
+            .to_account_metas(None),
+        );
+        self.send(&[ix], signer, &[])
     }
 
     pub fn program_data(&self) -> Pubkey {
@@ -622,7 +726,8 @@ impl Env {
             config: self.config,
             maker_permit: self.permit_pda(maker),
             offer: self.offer_pda(maker, offer_id),
-            delegate: self.delegate,
+            delegate: self.delegate_of(&self.offer_pda(maker, offer_id)),
+            maker_state: self.maker_state_pda(maker),
             system_program: system_program::ID,
         }
         .to_account_metas(None);
@@ -665,9 +770,10 @@ impl Env {
         want: &[Slot],
         expires_at: i64,
     ) -> Pubkey {
+        let offer = self.offer_pda(&maker.pubkey(), offer_id);
         let mut ixs: Vec<Instruction> = give
             .iter()
-            .map(|a| self.delegate_ix(*a, &maker.pubkey()))
+            .map(|a| self.delegate_ix(*a, &maker.pubkey(), &offer))
             .collect();
         ixs.push(self.create_offer_ix(&maker.pubkey(), offer_id, give, want, expires_at));
         let res = self.send(&ixs, maker, &[]).res;
@@ -683,6 +789,52 @@ impl Env {
         taker_assets: &[Pubkey],
         core_program: Pubkey,
     ) -> Instruction {
+        let max_fee = self.fee_config().map_or(0, |f| f.lamports);
+        self.fill_ix_fee(
+            taker,
+            offer,
+            give_accounts,
+            taker_assets,
+            core_program,
+            max_fee,
+        )
+    }
+
+    /// `fill_ix_with` with an explicit `max_fee`, paid to the recipient the fee account names.
+    pub fn fill_ix_fee(
+        &self,
+        taker: &Pubkey,
+        offer: &Pubkey,
+        give_accounts: &[Pubkey],
+        taker_assets: &[Pubkey],
+        core_program: Pubkey,
+        max_fee: u64,
+    ) -> Instruction {
+        let recipient = self
+            .fee_config()
+            .map_or(self.fee_recipient, |f| f.recipient);
+        self.fill_ix_full(
+            taker,
+            offer,
+            give_accounts,
+            taker_assets,
+            core_program,
+            max_fee,
+            recipient,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_ix_full(
+        &self,
+        taker: &Pubkey,
+        offer: &Pubkey,
+        give_accounts: &[Pubkey],
+        taker_assets: &[Pubkey],
+        core_program: Pubkey,
+        max_fee: u64,
+        fee_recipient: Pubkey,
+    ) -> Instruction {
         let o = self.offer(offer);
         let mut metas = mud_trade_book::accounts::FillOffer {
             taker: *taker,
@@ -690,7 +842,9 @@ impl Env {
             offer: *offer,
             maker: o.maker,
             config: self.config,
-            delegate: self.delegate,
+            delegate: self.delegate_of(offer),
+            fee_config: self.fee,
+            fee_recipient,
             collection: self.collection,
             core_program,
             system_program: system_program::ID,
@@ -712,7 +866,7 @@ impl Env {
         );
         Instruction::new_with_bytes(
             self.program_id,
-            &mud_trade_book::instruction::FillOffer {}.data(),
+            &mud_trade_book::instruction::FillOffer { max_fee }.data(),
             metas,
         )
     }
@@ -751,7 +905,7 @@ impl Env {
             maker: *signer,
             offer: *offer,
             config: self.config,
-            delegate: self.delegate,
+            delegate: self.delegate_of(offer),
             collection: self.collection,
             core_program: CORE_ID,
             system_program: system_program::ID,
@@ -791,7 +945,7 @@ impl Env {
             offer: *offer,
             maker,
             config: self.config,
-            delegate: self.delegate,
+            delegate: self.delegate_of(offer),
             collection: self.collection,
             core_program: CORE_ID,
             system_program: system_program::ID,
@@ -923,14 +1077,23 @@ pub struct Tree {
 impl Tree {
     pub fn new(entries: &[(Pubkey, u8, u8)]) -> Self {
         use mud_trade_book::registry::{leaf_hash, node_hash};
-        let leaves: Vec<[u8; 32]> = entries.iter().map(|(a, n, f)| leaf_hash(a, *n, *f)).collect();
+        let leaves: Vec<[u8; 32]> = entries
+            .iter()
+            .map(|(a, n, f)| leaf_hash(a, *n, *f))
+            .collect();
         let mut levels = vec![leaves];
         while levels.last().unwrap().len() > 1 {
             let next = levels
                 .last()
                 .unwrap()
                 .chunks(2)
-                .map(|p| if p.len() == 2 { node_hash(&p[0], &p[1]) } else { p[0] })
+                .map(|p| {
+                    if p.len() == 2 {
+                        node_hash(&p[0], &p[1])
+                    } else {
+                        p[0]
+                    }
+                })
                 .collect();
             levels.push(next);
         }

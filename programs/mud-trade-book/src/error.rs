@@ -72,4 +72,18 @@ pub enum TradeError {
     CardMismatch,
     #[msg("A card record is missing or is not this card's")]
     BadCardRecord,
+    #[msg("The fee must be at most 0.01 SOL")]
+    BadFee,
+    #[msg("The trade fee is above the taker's maximum")]
+    FeeAboveMax,
+    #[msg("The fee recipient is not the configured one")]
+    WrongFeeRecipient,
+    #[msg("A give card moved collection; pass its current collection account")]
+    MissingCollection,
+    #[msg("The offer id must be one more than the maker's last offer id")]
+    OfferIdNotNext,
+    #[msg("The fee recipient must be a funded system wallet")]
+    BadFeeRecipient,
+    #[msg("A give card is a Core account this program cannot read")]
+    UnreadableAsset,
 }

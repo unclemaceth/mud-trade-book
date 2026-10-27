@@ -34,6 +34,22 @@ impl CoreAsset {
     }
 }
 
+/// Whether a give account can no longer carry a delegation: not owned by Core, empty, or a
+/// burned asset (Core leaves one `Uninitialized` byte). Any other Core-owned account is a live
+/// asset and must decode.
+pub fn asset_gone(info: &AccountInfo) -> bool {
+    if *info.owner != CORE_PROGRAM_ID {
+        return true;
+    }
+    let Ok(data) = info.try_borrow_data() else {
+        return false;
+    };
+    match data.first() {
+        None => true,
+        Some(key) => *key == Key::Uninitialized as u8,
+    }
+}
+
 /// Owner-checks the account against Core, then decodes it.
 pub fn read_asset(info: &AccountInfo) -> Result<CoreAsset> {
     require_keys_eq!(*info.owner, CORE_PROGRAM_ID, TradeError::NotCoreAsset);
@@ -140,7 +156,8 @@ pub fn core_transfer(accounts: TransferAccounts<'_, '_>, signer_seeds: &[&[&[u8]
 pub struct RevokeAccounts<'a, 'b> {
     pub core_program: &'b AccountInfo<'a>,
     pub asset: &'b AccountInfo<'a>,
-    pub collection: &'b AccountInfo<'a>,
+    /// The asset's current collection; `None` when it is in no collection.
+    pub collection: Option<&'b AccountInfo<'a>>,
     pub payer: &'b AccountInfo<'a>,
     pub delegate: &'b AccountInfo<'a>,
     pub system_program: &'b AccountInfo<'a>,
@@ -162,7 +179,7 @@ pub fn core_revoke_transfer_delegate(
         accounts.core_program,
         RevokePluginAuthorityV1CpiAccounts {
             asset: accounts.asset,
-            collection: Some(accounts.collection),
+            collection: accounts.collection,
             payer: accounts.payer,
             authority: Some(accounts.delegate),
             system_program: accounts.system_program,

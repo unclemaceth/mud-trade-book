@@ -17,7 +17,10 @@ pub fn node_hash(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn verify_proof(leaf: [u8; 32], proof: &[[u8; 32]], root: &[u8; 32]) -> bool {
-    proof.iter().fold(leaf, |acc, sibling| node_hash(&acc, sibling)) == *root
+    proof
+        .iter()
+        .fold(leaf, |acc, sibling| node_hash(&acc, sibling))
+        == *root
 }
 
 #[cfg(test)]
@@ -32,7 +35,13 @@ mod tests {
             let prev = levels.last().unwrap();
             let next = prev
                 .chunks(2)
-                .map(|p| if p.len() == 2 { node_hash(&p[0], &p[1]) } else { p[0] })
+                .map(|p| {
+                    if p.len() == 2 {
+                        node_hash(&p[0], &p[1])
+                    } else {
+                        p[0]
+                    }
+                })
                 .collect();
             levels.push(next);
         }
@@ -73,7 +82,10 @@ mod tests {
                 .collect();
             let (levels, root) = build(&leaves);
             for (i, leaf) in leaves.iter().enumerate() {
-                assert!(verify_proof(*leaf, &proof(&levels, i), &root), "n {n} i {i}");
+                assert!(
+                    verify_proof(*leaf, &proof(&levels, i), &root),
+                    "n {n} i {i}"
+                );
             }
         }
     }
@@ -81,17 +93,44 @@ mod tests {
     #[test]
     fn wrong_identity_or_asset_fails() {
         let assets = keys(9);
-        let leaves: Vec<_> = assets.iter().map(|a| leaf_hash(a, 5, FINISH_BASE)).collect();
+        let leaves: Vec<_> = assets
+            .iter()
+            .map(|a| leaf_hash(a, 5, FINISH_BASE))
+            .collect();
         let (levels, root) = build(&leaves);
         let p = proof(&levels, 3);
-        assert!(verify_proof(leaf_hash(&assets[3], 5, FINISH_BASE), &p, &root));
-        assert!(!verify_proof(leaf_hash(&assets[3], 6, FINISH_BASE), &p, &root));
-        assert!(!verify_proof(leaf_hash(&assets[3], 5, FINISH_FOIL), &p, &root));
-        assert!(!verify_proof(leaf_hash(&assets[4], 5, FINISH_BASE), &p, &root));
-        assert!(!verify_proof(leaf_hash(&assets[3], 5, FINISH_BASE), &p[1..], &root));
+        assert!(verify_proof(
+            leaf_hash(&assets[3], 5, FINISH_BASE),
+            &p,
+            &root
+        ));
+        assert!(!verify_proof(
+            leaf_hash(&assets[3], 6, FINISH_BASE),
+            &p,
+            &root
+        ));
+        assert!(!verify_proof(
+            leaf_hash(&assets[3], 5, FINISH_FOIL),
+            &p,
+            &root
+        ));
+        assert!(!verify_proof(
+            leaf_hash(&assets[4], 5, FINISH_BASE),
+            &p,
+            &root
+        ));
+        assert!(!verify_proof(
+            leaf_hash(&assets[3], 5, FINISH_BASE),
+            &p[1..],
+            &root
+        ));
         let mut extra = p.clone();
         extra.push([7; 32]);
-        assert!(!verify_proof(leaf_hash(&assets[3], 5, FINISH_BASE), &extra, &root));
+        assert!(!verify_proof(
+            leaf_hash(&assets[3], 5, FINISH_BASE),
+            &extra,
+            &root
+        ));
     }
 
     /// A fixed root for seven leaves; an off-chain builder must reproduce it.
@@ -100,17 +139,29 @@ mod tests {
         let leaves: Vec<_> = keys(7)
             .iter()
             .enumerate()
-            .map(|(i, a)| leaf_hash(a, (i % 120) as u8 + 1, if i % 2 == 0 { FINISH_BASE } else { FINISH_FOIL }))
+            .map(|(i, a)| {
+                leaf_hash(
+                    a,
+                    (i % 120) as u8 + 1,
+                    if i % 2 == 0 { FINISH_BASE } else { FINISH_FOIL },
+                )
+            })
             .collect();
         let (_, root) = build(&leaves);
         let hex: String = root.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "6ca4968874b88b9389927573ec227479bf019e59cf8da55af80dfab0e6dadd28");
+        assert_eq!(
+            hex,
+            "6ca4968874b88b9389927573ec227479bf019e59cf8da55af80dfab0e6dadd28"
+        );
     }
 
     #[test]
     fn inner_node_cannot_pass_as_leaf() {
         let assets = keys(4);
-        let leaves: Vec<_> = assets.iter().map(|a| leaf_hash(a, 1, FINISH_BASE)).collect();
+        let leaves: Vec<_> = assets
+            .iter()
+            .map(|a| leaf_hash(a, 1, FINISH_BASE))
+            .collect();
         let (levels, root) = build(&leaves);
         // levels[1][0] is an inner node; presenting it with the leaf-level proof of its parent
         // must not verify as anything a leaf hash can reach.

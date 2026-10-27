@@ -22,8 +22,8 @@ pub struct CancelOffer<'info> {
     pub offer: Account<'info, Offer>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
-    /// CHECK: PDA with no data; signs the Core revokes.
-    #[account(seeds = [DELEGATE_SEED], bump)]
+    /// CHECK: this offer's delegate PDA, no data; signs the Core revokes.
+    #[account(seeds = [DELEGATE_SEED, offer.key().as_ref()], bump)]
     pub delegate: UncheckedAccount<'info>,
     /// CHECK: must be the configured collection (Core-owned, checked at init). Writable only
     /// because Core's revoke marks it writable; this program never writes it.
@@ -35,26 +35,31 @@ pub struct CancelOffer<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Works while paused. Remaining accounts: the give assets (offer order), then their `Listed`
-/// PDAs (offer order).
+/// Works while paused. Remaining accounts: the give assets (offer order), their `Listed` PDAs
+/// (offer order), then the current collection of any give card that left the configured one
+/// (writable, any order, at most four).
 pub fn handle_cancel_offer<'info>(ctx: Context<'info, CancelOffer<'info>>) -> Result<()> {
     let offer = &ctx.accounts.offer;
     let n = offer.give.len();
-    let expected_len = n.checked_mul(2).ok_or(TradeError::Overflow)?;
+    let fixed = n.checked_mul(2).ok_or(TradeError::Overflow)?;
     require!(
-        ctx.remaining_accounts.len() == expected_len,
+        ctx.remaining_accounts.len() >= fixed,
         TradeError::AccountCount
     );
-    let (give_infos, listed_infos) = ctx.remaining_accounts.split_at(n);
+    let (give_infos, rest) = ctx.remaining_accounts.split_at(n);
+    let (listed_infos, other_collections) = rest.split_at(n);
 
+    let offer_key = offer.key();
     let maker_info = ctx.accounts.maker.to_account_info();
     let revoked = revoke_listed_delegations(
         &offer.give,
         give_infos,
         ReleaseAccounts {
+            offer: &offer_key,
             maker: &offer.maker,
             collection_key: &ctx.accounts.config.collection,
             collection: &ctx.accounts.collection.to_account_info(),
+            other_collections,
             core_program: &ctx.accounts.core_program.to_account_info(),
             payer: &maker_info,
             delegate: &ctx.accounts.delegate.to_account_info(),
@@ -63,7 +68,6 @@ pub fn handle_cancel_offer<'info>(ctx: Context<'info, CancelOffer<'info>>) -> Re
         },
     )?;
 
-    let offer_key = offer.key();
     for (key, info) in offer.give.iter().zip(listed_infos) {
         close_listed(info, key, &offer_key, &maker_info, ctx.program_id)?;
     }

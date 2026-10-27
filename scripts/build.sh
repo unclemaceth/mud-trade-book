@@ -17,18 +17,25 @@ have_anchor=$(anchor --version | awk '{print $2}')
 
 so=target/deploy/mud_trade_book.so
 idl=target/idl/mud_trade_book.json
-# The program id is fixed by declare_id! in lib.rs. Anchor writes a throwaway keypair to
-# target/deploy when none exists; it does not change the ELF and cannot deploy to the real id.
+# The program id comes from `declare_id!`, not a keypair: the build needs no secret. Anchor
+# writes a random keypair here when none exists; one it made is deleted after the build, and
+# deploys pass the program keypair explicitly.
+program_key=target/deploy/mud_trade_book-keypair.json
+program_id=$(sed -n 's/^declare_id!("\([1-9A-HJ-NP-Za-km-z]*\)");$/\1/p' programs/mud-trade-book/src/lib.rs)
+[[ -n "$program_id" ]] || { echo "no declare_id! in lib.rs" >&2; exit 1; }
+had_key=0; [[ -e "$program_key" ]] && had_key=1
 
-# Avoid `cargo clean`: it also deletes target/deploy.
+# Never `cargo clean`: it deletes target/deploy, which can hold the program id keypair.
 clean() {
   rm -rf target/sbpf-solana-solana target/sbpfv3-solana-solana target/release target/idl target/types
 }
 
 build() {
   rm -f "$so" "$idl"
-  anchor build --arch v0
+  anchor build --arch v0 --ignore-keys
+  (( had_key )) || rm -f "$program_key"
   [[ -s "$so" && -s "$idl" ]] || { echo "build produced no artifacts" >&2; exit 1; }
+  [[ "$(jq -r .address "$idl")" == "$program_id" ]] || { echo "IDL address is not $program_id" >&2; exit 1; }
   # The ELF is public once deployed. /Users/runner in it is the platform-tools CI build of std.
   if strings "$so" | grep -qiF -e "$HOME" -e "$(id -un)" -e "$PWD"; then
     echo "the ELF embeds the builder's home, user name or checkout path" >&2
